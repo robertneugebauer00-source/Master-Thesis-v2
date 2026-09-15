@@ -1,0 +1,425 @@
+---
+title: "S2 -- Model-based community detection (SBM / DC-SBM)"
+subtitle: "Block structure selected by ICL, with no random-graph null at all -- the answer to 'modularity maximisation distorts the result'."
+author: "Robert Neugebauer (vRN)"
+date: "14.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+```
+
+
+# [vRN] Model-based community detection: SBM / DC-SBM {#sbm-blocks}
+
+Modularity maximisation has three known pathologies that no choice of random-graph
+null repairs: random graphs score high Q by chance (Guimera et al. 2004), the
+objective cannot resolve modules below ~sqrt(2m) edges (Fortunato & Barthelemy 2007),
+and the Q landscape is degenerate (Good et al. 2010). A stochastic block model
+replaces the optimised heuristic with a generative model, so the question "is there
+block structure?" is settled by ICL model selection (K = 1 against K > 1) rather than
+by rewiring. It is also not restricted to assortative blocks.
+
+**Why this is inferential validation, not a competing partition.** The block model is not
+run here to produce a better set of modules. It is run to test whether the modularity
+partition survives a method that shares none of its assumptions. Modularity maximisation
+optimises a quality function with a built-in degree null, a resolution limit and a
+degenerate landscape; a stochastic block model instead posits a generative process and lets
+ICL choose K, so "is there block structure at all?" becomes a model-selection question
+(K = 1 against K > 1) answered without any rewiring, and the blocks are free to be
+disassortative. If two methods with disjoint assumptions agree about which compounds group
+together, the grouping is a property of the data rather than of the objective function.
+That is the purpose of this section, and it is why the comparison is scored against the
+independently documented parent/metabolite pairs rather than against Q.
+
+**Outcome (A28, 23.08.2026): the block model was tried and rejected, and that strengthens
+the modularity result rather than weakening it.** Scored against a degree-preserving null --
+each method refit on rewired graphs that keep every degree but destroy the chemistry --
+fast-greedy recovers known chemistry far above chance in all three basins (z = +4.18 to
++4.81, p = 0.005, the empirical floor for 200 draws), while the SBM sits *below* its own
+null in the Elbe and the Rhine and only marginally above it in the Danube. The higher raw
+recovery rate of the SBM (60-67 % of ground-truth pairs co-assigned) is granularity, not
+chemistry: on rewired graphs it collapses to roughly three coarse blocks whose
+co-assignment background is already 30-36 %. Two attempts at a properly degree-corrected
+SBM failed to converge at this network size (abandoned after 55 and 36 minutes). Report
+this as a negative result with the table rather than as a silent omission -- it is what
+licenses `cluster_fast_greedy` as the partition of record.
+
+```{r vrn-sbm-blocks, results='hide'}
+
+## ---------------------------------------------------------------------
+## [vRN 20.08.2026] Model-based community detection: SBM / DC-SBM
+## Answers the "modularity maximisation distorts the result" objection
+## without any random-graph null: block structure is selected by ICL
+## (K = 1 vs K > 1), and scored against the known parent/metabolite pairs.
+## Reads the cached glasso fits; refits nothing.
+##
+## [repo 15.09.2026] WHERE THE FITS COME FROM -- the external dependency is
+## gone. Previously this chunk read `outputs_vRN/followups/_fit_cache.rds`,
+## which was produced by vRN_followups.R -- a script that is NOT in this
+## repository. The mainline now saves fitted_<kind>_<unit>.rds per unit, and
+## sgh_get_fits() reads those. The legacy external cache is kept as a fallback
+## for backwards compatibility only.
+## ---------------------------------------------------------------------
+
+## fit source, in order of preference:
+##   1. an explicit `cache` argument (a fits list, or a path to a legacy .rds)
+##   2. the fitted rds written by analysis/03_mainline.Rmd  <- the normal case
+##   3. the legacy external vRN_followups.R cache           <- fallback only
+## [repo 15.09.2026] 2 and 3 are MERGED, not either/or: the mainline never runs
+## the four Reach_* units (see 03_mainline.Rmd), so units that exist only in
+## the legacy cache are kept, while overlapping units take the in-repo mainline
+## fit. CAVEAT: if your legacy cache was fitted with different settings than
+## the current mainline, re-knitting S2 changes its numbers -- the mainline
+## rds are the canonical fits, and the legacy-only units are marked below.
+sgh_get_fits <- function(cache = NULL, kind = "conc") {
+  if (is.list(cache)) return(cache)
+  if (is.character(cache) && file.exists(cache)) return(readRDS(cache))
+  or <- if (exists("outroot", envir = globalenv(), inherits = TRUE))
+          get("outroot", envir = globalenv()) else file.path("..", "outputs_vRN")
+
+  ## legacy cache: the original code looked in two places depending on whether
+  ## `outroot` existed -- check both
+  legacy_paths <- unique(file.path(c(dirname(or), or), "followups", "_fit_cache.rds"))
+  legacy_paths <- legacy_paths[file.exists(legacy_paths)]
+  fits <- list()
+  if (length(legacy_paths)) {
+    fits <- readRDS(legacy_paths[[1]])
+    message("[repo] S2 fits: legacy cache as base layer: ", legacy_paths[[1]],
+            " (", length(fits), " units)")
+  }
+
+  kd <- file.path(or, kind_dir(kind))
+  safes <- if (dir.exists(kd)) list.dirs(kd, recursive = FALSE, full.names = FALSE) else character(0)
+  n_main <- 0L
+  for (s in safes) {
+    fc <- tryCatch(load_fitted(kind, s, root = or), error = function(e) NULL)
+    if (!is.null(fc)) { fits[[s]] <- list(A = fc$A_glasso, n_sites = fc$n_sites); n_main <- n_main + 1L }
+  }
+  if (n_main) message("[repo] S2 fits: ", n_main, " unit(s) taken from the mainline rds cache",
+                      if (length(fits) > n_main)
+                        sprintf("; %d legacy-only unit(s) kept: %s", length(fits) - n_main,
+                                paste(setdiff(names(fits), safes), collapse = ", ")) else "")
+  if (length(fits)) return(fits)
+  stop("no fitted networks found -- run analysis/03_mainline.Rmd first ",
+       "(it writes fitted_<kind>_<unit>.rds per unit)")
+}
+
+sbm_compare_unit <- function(unit_name = "Basin_Elbe",
+                             cache = NULL,
+                             seed = 1) {
+  if (!all(vapply(c("greed","sbm","igraph"), requireNamespace, logical(1), quietly = TRUE)))
+    stop("needs greed, sbm, igraph -- neither is loaded by 00_setup.R; install them first")
+  fits <- sgh_get_fits(cache)
+  if (is.null(fits[[unit_name]])) stop("unit not in the fit store: ", unit_name)
+  set.seed(seed)
+
+  A  <- fits[[unit_name]]$A
+  cn <- rownames(A)
+  Ab <- (A != 0) * 1; diag(Ab) <- 0
+  ## a small minority of cached fits carry negative partial correlations
+  ## (0-3.6 % of edges). fast-greedy refuses negative weights, so cluster on
+  ## |w| - the standard convention - and record how many edges were flipped.
+  n_neg <- sum(A[upper.tri(A)] < 0)
+  g  <- igraph::graph_from_adjacency_matrix(abs(A), mode = "undirected",
+                                            weighted = TRUE, diag = FALSE)
+
+  ## known parent / metabolite / isomer families present in this unit
+  fam0 <- list(
+    Metoprolol       = c("Metoprolol", "Metoprolol acid"),
+    Carbamazepine    = c("Carbamazepine", "10,11-Dihydro-10,11-dihydroxycarbamazepine",
+                         "2-Hydroxycarbamazepine", "10,11-Dihydro-10-hydroxycarbamazepine"),
+    Benzotriazole    = c("1H-Benzotriazole", "5-Methyl-1H-benzotriazole",
+                         "4-Hydroxybenzotriazole"),
+    DEET             = c("DEET", "DEET carboxylic acid"),
+    Metolachlor      = c("Metolachlor", "Metolachlor OA", "Metolachlor ESA",
+                         "Metolachlor-NOA 413173", "Metolachlor CGA 357704",
+                         "Metolachlor CGA 368208"),
+    Thiacloprid      = c("Thiacloprid", "Thiacloprid amide"),
+    Terbuthylazine   = c("Terbuthylazine", "Terbuthylazine-2-hydroxy",
+                         "2-Hydroxydesethylterbuthylazine"),
+    Sulfamethoxazole = c("Sulfamethoxazole", "Acetyl-sulfamethoxazole"))
+  fam <- lapply(fam0, function(m) m[m %in% cn])
+  fam <- fam[vapply(fam, length, 1L) >= 2L]
+  gt  <- do.call(rbind, lapply(names(fam), function(f) {
+    ij <- t(utils::combn(fam[[f]], 2))
+    data.frame(family = f, a = ij[, 1], b = ij[, 2], stringsAsFactors = FALSE)
+  }))
+
+  ## chance-corrected score. enrichment = observed / expected-under-random-
+  ## relabelling-at-the-same-block-sizes. Never compare raw pair counts
+  ## between partitions of different granularity.
+  score <- function(memb, label) {
+    memb <- as.integer(memb); names(memb) <- cn
+    same <- memb[gt$a] == memb[gt$b]
+    ns <- as.numeric(table(memb)); n <- length(memb)
+    p_chance <- sum(ns * (ns - 1)) / (n * (n - 1))
+    exp_pairs <- nrow(gt) * p_chance
+    data.frame(method = label, K = length(unique(memb)), largest = max(ns),
+               singletons = sum(ns == 1),
+               Q = igraph::modularity(g, memb, weights = igraph::E(g)$weight),
+               pairs = sum(same), n_pairs = nrow(gt),
+               expected = exp_pairs, enrichment = sum(same) / exp_pairs,
+               stringsAsFactors = FALSE)
+  }
+
+  res <- list(
+    score(igraph::membership(igraph::cluster_fast_greedy(g, weights = igraph::E(g)$weight)),
+          "fast-greedy (modularity)"),
+    score(igraph::membership(igraph::cluster_leiden(g, weights = igraph::E(g)$weight,
+            objective_function = "modularity", n_iterations = 10)),
+          "Leiden (modularity)"))
+
+  fit_dc <- greed::greed(Ab, model = greed::DcSbm(), verbose = FALSE)
+  res <- c(res, list(score(greed::clustering(fit_dc),
+                           sprintf("DC-SBM (greed, ICL K=%d)", fit_dc@K))))
+
+  fit_b <- sbm::estimateSimpleSBM(Ab, model = "bernoulli", dimLabels = "compound",
+             estimOptions = list(verbosity = 0, plot = FALSE, nbCores = 1, exploreMax = 25))
+  res <- c(res, list(score(fit_b$memberships,
+                           sprintf("SBM (sbm::ICL K=%d)", fit_b$nbBlocks))))
+
+  ## null-free evidence for block structure: ICL(K) vs ICL(K = 1)
+  icl <- data.frame(K = fit_b$storedModels$nbBlocks, ICL = fit_b$storedModels$ICL)
+  icl$dICL_vs_K1 <- icl$ICL - icl$ICL[icl$K == 1]
+
+  ## block connectivity: diagonal = within, off-diagonal = between.
+  ## any row where max(off-diagonal) > diagonal is structure that a
+  ## modularity objective cannot represent.
+  P <- fit_b$connectParam$mean
+  dg <- diag(P); od <- P; diag(od) <- NA
+  blocks <- data.frame(block = seq_along(dg),
+                       prop = as.numeric(fit_b$blockProp),
+                       within = dg,
+                       max_between = apply(od, 1, max, na.rm = TRUE),
+                       partner = apply(od, 1, which.max))
+  blocks$assortative <- blocks$within > blocks$max_between
+
+  tabout <- do.call(rbind, res); tabout$n_neg_edges <- n_neg
+  list(table = tabout, icl = icl, blocks = blocks,
+       connect = P, memb_sbm = fit_b$memberships, memb_dcsbm = greed::clustering(fit_dc))
+}
+
+
+## ---------------------------------------------------------------------
+## Batch driver. Everything from this section is written to its OWN folder
+## (outputs_vRN/sbm_blocks), not into the concentration/toxic_unit trees.
+## ---------------------------------------------------------------------
+sbm_dir <- function() {
+  or <- if (exists("outroot", envir = globalenv(), inherits = TRUE))
+          get("outroot", envir = globalenv()) else file.path("..", "outputs_vRN")
+  d <- file.path(dirname(or), "sbm_blocks")
+  dir.create(d, showWarnings = FALSE, recursive = TRUE); d
+}
+
+## one two-panel figure per unit: network coloured by block | block density matrix
+sbm_plot_unit <- function(res, unit_name, A, file) {
+  memb <- res$memb_sbm; P <- res$connect
+  br   <- res$blocks
+  g    <- igraph::graph_from_adjacency_matrix(abs(A), mode = "undirected",
+                                              weighted = TRUE, diag = FALSE)
+  deg  <- igraph::degree(g)
+  pal  <- grDevices::hcl.colors(nrow(br), "Dark 3")
+  fillc <- pal[memb]; fillc[deg == 0] <- "grey85"
+  ## non-assortative blocks get a red border, assortative a dark grey one
+  bord <- ifelse(br$assortative[memb], "grey30", "#CC071E")
+  bord[deg == 0] <- "grey70"
+
+  grDevices::png(file, width = 2000, height = 1000, res = 150, bg = "white")
+  on.exit(grDevices::dev.off(), add = TRUE)
+  graphics::par(mfrow = c(1, 2), bg = "white", mar = c(2, 2, 4, 1))
+  set.seed(1); lay <- igraph::layout_with_fr(g)
+  plot(g, layout = lay, vertex.label = NA,
+       vertex.size = 3 + 4 * sqrt(deg / max(1, max(deg))),
+       vertex.color = fillc, vertex.frame.color = bord, vertex.frame.width = 2,
+       edge.color = "grey75", edge.width = 0.4,
+       main = sprintf("%s - SBM blocks (K = %d)", unit_name, nrow(br)))
+  graphics::legend("bottomleft", bty = "n", cex = 0.7,
+                   legend = c("assortative block", "non-assortative block", "isolate"),
+                   pt.bg = "white", pch = 21, col = c("grey30", "#CC071E", "grey70"))
+
+  graphics::par(mar = c(4, 4, 4, 5))
+  K <- nrow(P)
+  graphics::image(1:K, 1:K, t(P[K:1, , drop = FALSE]), axes = FALSE,
+                  col = grDevices::hcl.colors(64, "Blues 3", rev = TRUE),
+                  xlab = "block", ylab = "block", zlim = c(0, max(P)),
+                  main = "block connectivity (diag = within)")
+  graphics::axis(1, 1:K, 1:K); graphics::axis(2, 1:K, K:1, las = 1)
+  for (i in 1:K) for (j in 1:K)
+    graphics::text(j, K - i + 1, sprintf("%.2f", P[i, j]), cex = 0.65,
+                   col = if (P[i, j] > 0.5 * max(P)) "white" else "grey20",
+                   font = if (i == j) 2 else 1)
+  ## mark rows where the strongest off-diagonal beats the diagonal
+  bad <- which(!br$assortative)
+  if (length(bad))
+    graphics::rect(0.5, K - bad + 0.5, K + 0.5, K - bad + 1.5,
+                   border = "#CC071E", lwd = 3)
+  invisible(file)
+}
+
+sbm_compare_all <- function(units = NULL, cache = NULL, min_edges = 30, do_plots = TRUE) {
+  fits <- sgh_get_fits(cache)   ## [repo 15.09.2026] mainline rds first, legacy cache fallback
+  if (is.null(units)) units <- names(fits)
+  d <- sbm_dir()
+  keep <- vapply(units, function(u) {
+    A <- fits[[u]]$A; sum(A != 0) / 2 >= min_edges }, logical(1))
+  skipped <- units[!keep]; units <- units[keep]
+
+  all_tab <- list(); all_icl <- list(); all_blk <- list(); all_memb <- list()
+  for (u in units) {
+    r <- tryCatch(sbm_compare_unit(u, cache = cache),
+                  error = function(e) { message("[sbm] ", u, ": ", conditionMessage(e)); NULL })
+    if (is.null(r)) next
+    A <- fits[[u]]$A
+    Ab <- (A != 0) * 1; diag(Ab) <- 0
+    ud <- file.path(d, u); dir.create(ud, showWarnings = FALSE, recursive = TRUE)
+    write.csv(r$table,  file.path(ud, "sbm_vs_modularity.csv"), row.names = FALSE)
+    write.csv(r$icl,    file.path(ud, "sbm_icl_path.csv"),      row.names = FALSE)
+    write.csv(r$blocks, file.path(ud, "sbm_block_roles.csv"),   row.names = FALSE)
+    mb <- data.frame(compound = rownames(A), degree = rowSums(Ab),
+                     block_sbm = r$memb_sbm, block_dcsbm = r$memb_dcsbm,
+                     non_assortative = !r$blocks$assortative[r$memb_sbm],
+                     stringsAsFactors = FALSE)
+    write.csv(mb, file.path(ud, "sbm_memberships.csv"), row.names = FALSE)
+    if (do_plots) tryCatch(sbm_plot_unit(r, u, A, file.path(ud, "fig_sbm_blocks.png")),
+                           error = function(e) message("[sbm plot] ", u, ": ", conditionMessage(e)))
+
+    all_tab[[u]]  <- cbind(unit = u, r$table)
+    all_icl[[u]]  <- cbind(unit = u, r$icl)
+    all_blk[[u]]  <- cbind(unit = u, r$blocks)
+    all_memb[[u]] <- cbind(unit = u, mb)
+  }
+
+  tab <- do.call(rbind, all_tab); icl <- do.call(rbind, all_icl)
+  blk <- do.call(rbind, all_blk); mem <- do.call(rbind, all_memb)
+
+  ## one row per unit: is the block structure supported, and how much of it
+  ## is structure a modularity objective cannot express?
+  summ <- do.call(rbind, lapply(names(all_blk), function(u) {
+    b <- all_blk[[u]]; m <- all_memb[[u]]; A <- fits[[u]]$A
+    Ab <- (A != 0) * 1; diag(Ab) <- 0
+    ic <- all_icl[[u]]
+    tt <- all_tab[[u]]
+    data.frame(unit = u,
+               n_sites = fits[[u]]$n_sites, n_comp = nrow(A),
+               E = sum(Ab) / 2, isolate_frac = mean(rowSums(Ab) == 0),
+               density = sum(Ab) / (nrow(A) * (nrow(A) - 1)),
+               K_icl = nrow(b),
+               dICL_vs_K1 = max(ic$dICL_vs_K1),
+               n_nonassort = sum(!b$assortative),
+               frac_nodes_nonassort = mean(m$non_assortative),
+               Q_fastgreedy = tt$Q[tt$method == "fast-greedy (modularity)"],
+               enrich_fastgreedy = tt$enrichment[tt$method == "fast-greedy (modularity)"],
+               enrich_sbm = tt$enrichment[grepl("^SBM", tt$method)],
+               stringsAsFactors = FALSE)
+  }))
+
+  write.csv(tab,  file.path(d, "all_units_sbm_vs_modularity.csv"), row.names = FALSE)
+  write.csv(icl,  file.path(d, "all_units_icl_paths.csv"),         row.names = FALSE)
+  write.csv(blk,  file.path(d, "all_units_block_roles.csv"),       row.names = FALSE)
+  write.csv(mem,  file.path(d, "all_units_memberships.csv"),       row.names = FALSE)
+  write.csv(summ, file.path(d, "summary_by_unit.csv"),             row.names = FALSE)
+  if (length(skipped))
+    writeLines(skipped, file.path(d, "_skipped_units.txt"))
+  list(dir = d, summary = summ, table = tab, icl = icl, blocks = blk,
+       memberships = mem, skipped = skipped)
+}
+
+sbm_all <- tryCatch(sbm_compare_all(),
+                    error = function(e) { message("[vRN] SBM batch skipped: ",
+                                                  conditionMessage(e)); NULL })
+if (!is.null(sbm_all)) print(sbm_all$summary)
+
+## ---------------------------------------------------------------------
+## Cross-unit summary: where does modularity struggle, and does it track
+## anything? Written to the same sbm_blocks folder.
+## ---------------------------------------------------------------------
+sbm_summary_figure <- function(res = sbm_all, file = NULL) {
+  s <- res$summary
+  if (is.null(file)) file <- file.path(res$dir, "fig_sbm_across_units.png")
+  s$basin <- ifelse(grepl("Elbe", s$unit), "Elbe",
+             ifelse(grepl("Danube", s$unit), "Danube",
+             ifelse(grepl("Rhine", s$unit), "Rhine",
+             ifelse(grepl("Tajo", s$unit), "Tajo", "Basque"))))
+  s$position <- factor(ifelse(grepl("Upper|Upstream", s$unit), "upper",
+                       ifelse(grepl("Middle", s$unit), "middle",
+                       ifelse(grepl("Lower|Downstream", s$unit), "lower", "whole"))),
+                       levels = c("whole", "upper", "middle", "lower"))
+  bc <- c(Elbe = "#004890", Danube = "#57AB27", Rhine = "#CC071E",
+          Tajo = "#F6A800", Basque = "grey45")
+  col <- bc[s$basin]
+
+  grDevices::png(file, width = 2400, height = 1800, res = 170, bg = "white")
+  on.exit(grDevices::dev.off(), add = TRUE)
+  graphics::par(mfrow = c(2, 2), bg = "white", mar = c(4.5, 4.5, 3.5, 1.2), las = 1)
+
+  ## A. ICL paths, all units
+  ic <- res$icl
+  plot(NA, xlim = range(ic$K), ylim = c(0, max(ic$dICL_vs_K1)),
+       xlab = "number of blocks K", ylab = expression(Delta*"ICL vs K = 1"),
+       main = "A  Block structure is selected by ICL, not by a null")
+  graphics::abline(h = 0, col = "grey70")
+  for (u in unique(ic$unit)) {
+    z <- ic[ic$unit == u, ]
+    graphics::lines(z$K, z$dICL_vs_K1, col = bc[s$basin[match(u, s$unit)]], lwd = 1.6)
+    k <- z$K[which.max(z$dICL_vs_K1)]
+    graphics::points(k, max(z$dICL_vs_K1), pch = 19, cex = 0.8,
+                     col = bc[s$basin[match(u, s$unit)]])
+  }
+  graphics::legend("bottomright", names(bc), col = bc, lwd = 2, bty = "n", cex = 0.8)
+  graphics::mtext("dot = ICL optimum; every unit peaks at K > 1", 3, 0.2, cex = 0.7, col = "grey30")
+
+  ## B. non-assortative share vs how well modularity recovers known chemistry
+  ct <- suppressWarnings(cor.test(s$frac_nodes_nonassort, s$enrich_fastgreedy,
+                                  method = "spearman"))
+  plot(s$enrich_fastgreedy, s$frac_nodes_nonassort, pch = 19, col = col, cex = 1.4,
+       xlab = "fast-greedy enrichment on known parent/metabolite pairs",
+       ylab = "share of compounds in non-assortative blocks",
+       main = "B  Modularity does worst where blocks are non-assortative")
+  graphics::text(s$enrich_fastgreedy, s$frac_nodes_nonassort,
+                 sub("^(Basin|Sec|Reach)_", "", s$unit), pos = 3, cex = 0.52, col = "grey30")
+  graphics::mtext(sprintf("Spearman rho = %.2f, p = %.3f", ct$estimate, ct$p.value),
+                  3, 0.2, cex = 0.75, col = "grey30")
+
+  ## C. longitudinal position
+  graphics::boxplot(frac_nodes_nonassort ~ position, data = s, col = "grey92",
+          border = "grey40", xlab = "position in the basin",
+          ylab = "share of compounds in non-assortative blocks",
+          main = "C  Non-assortative structure increases downstream")
+  graphics::points(jitter(as.integer(s$position), 0.5), s$frac_nodes_nonassort,
+                   pch = 19, col = col, cex = 1.2)
+
+  ## D. head-to-head on the chemistry benchmark
+  o <- order(s$enrich_fastgreedy)
+  graphics::plot(s$enrich_fastgreedy[o], seq_len(nrow(s)), pch = 19, col = "#004890",
+       xlim = c(0, max(s$enrich_fastgreedy) * 1.05), yaxt = "n", ylab = "",
+       xlab = "enrichment on known parent/metabolite pairs (chance = 1)",
+       main = "D  Chance-corrected, modularity still wins the chemistry test")
+  graphics::points(s$enrich_sbm[o], seq_len(nrow(s)), pch = 19, col = "#CC071E")
+  graphics::segments(s$enrich_sbm[o], seq_len(nrow(s)), s$enrich_fastgreedy[o],
+                     seq_len(nrow(s)), col = "grey75")
+  graphics::axis(2, seq_len(nrow(s)), sub("^(Basin|Sec|Reach)_", "", s$unit[o]),
+                 cex.axis = 0.6)
+  graphics::abline(v = 1, lty = 2, col = "grey50")
+  graphics::legend("bottomright", c("fast-greedy", "SBM (ICL)"),
+                   col = c("#004890", "#CC071E"), pch = 19, bty = "n", cex = 0.8)
+
+  ## enriched summary alongside
+  utils::write.csv(s, file.path(res$dir, "summary_by_unit_annotated.csv"), row.names = FALSE)
+  invisible(file)
+}
+
+if (!is.null(sbm_all)) sbm_summary_figure(sbm_all)
+```
+

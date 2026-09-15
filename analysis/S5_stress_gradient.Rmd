@@ -1,0 +1,299 @@
+---
+title: "S5 — The SGH test: modularity along the stress gradient"
+subtitle: "Per-unit stress index from toxic units vs glasso modularity, across all spatial units; with module-stability bootstrap."
+author: "Robert Neugebauer (vRN)"
+date: "15.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+```
+
+
+# Rationale (read me first)
+
+This is the test the thesis title promises. The Stress Gradient Hypothesis
+(SGH), as formulated for co-occurrence networks by Hernandez et al. (2021,
+ISME J 15:1722), predicts that **modular organisation declines along a stress
+gradient**: modules insulate sub-communities from disturbance, and that
+insulation is what increasing stress erodes. Their test is deliberately simple —
+a per-site stress ranking against the modularity Q of each site's network, by
+Spearman correlation. Here the unit of replication is the spatial unit
+(country group, whole basin, river section, reach), the stress axis is the
+mean per-site sum of toxic units (sum-TU = MEC/EC10, the mixture pressure), and
+the response is the modularity of the unit's glasso network.
+
+**The transfer caveat, stated openly.** What declines with stress in Hernandez
+et al. is niche and interaction compartmentalisation between organisms. What
+this pipeline measures is *source* compartmentalisation between chemicals — the
+edge-level evidence (A30) says modules here are emission-source compartments,
+not ecological niches. The SGH is therefore being tested by analogy: if stress
+homogenises the chemical environment (fewer, dominant sources at high pressure;
+a more even source mix at low pressure), source compartmentalisation should
+decline with it. That is a hypothesis about emissions, not about interactions,
+and the thesis should say so.
+
+**The n-confound is controlled, not ignored.** Units differ in site count, and
+sparser networks are mechanically more modular, so raw Q partly reports n
+rather than stress. Two controls are built in: the regressions are weighted by
+`n_sites` and include it as a covariate, and the rarefied cross-basin
+comparison in S3 (every basin at a common n) provides the independent
+cross-check. If the sign of the stress slope survives the n-adjustment, it is
+not an artefact of unit size.
+
+
+## Stress index per unit
+
+```{r s5-stress-index}
+## [repo 15.09.2026] S5 output folder. Everything this supplement writes lives
+## under <outroot>/stress_gradient/, so the mainline output tree stays untouched.
+out_s5 <- file.path(outroot, "stress_gradient")
+dir.create(out_s5, recursive = TRUE, showWarnings = FALSE)
+
+s5_all_units <- c(units, basin_units, section_units, reach_units)
+
+## the stress axis, per unit: per-site sum-TU (mixture pressure), summarised as
+## the mean, the 95th percentile (hotspot pressure), and the fraction of sites
+## carrying at least one absolute risk driver (RQ >= RQ_THRESH, Inostroza 2024).
+tu_ok <- nrow(tu_mat) > 0 && ncol(tu_mat) > 0
+if (!tu_ok)
+  message("[S5] tu_mat is empty (no EC10 source found) -- the stress axis cannot be built; downstream chunks will no-op.")
+
+stress_tab <- if (tu_ok) do.call(rbind, lapply(s5_all_units, function(u) {
+  sites <- intersect(u$site_ids, colnames(tu_mat))
+  if (length(sites) < 4) return(NULL)
+  sub_tu <- tu_mat[, sites, drop = FALSE]
+  sum_tu <- colSums(sub_tu)
+  data.frame(unit  = u$safe,
+             label = u$label,
+             basin = u$basin,
+             n_sites_tu = length(sites),
+             stress_mean = mean(sum_tu),
+             stress_p95  = as.numeric(quantile(sum_tu, 0.95)),
+             frac_sites_driver = mean(apply(sub_tu, 2, function(x) any(x >= RQ_THRESH))),
+             row.names = NULL)
+})) else NULL
+if (!is.null(stress_tab)) print(stress_tab)
+```
+
+
+## The response: Q from the cached mainline fits
+
+```{r s5-response}
+## [repo 15.09.2026] reads the mainline cache only -- S5 fits nothing itself, so
+## knit 03_mainline.Rmd first. Units without a cached fit are skipped, not refit.
+scale_of <- function(safe) {
+  if (grepl("^(Danube|Rhine)_", safe)) "group"
+  else if (grepl("^Basin_", safe))     "basin"
+  else if (grepl("^Sec_", safe))       "section"
+  else if (grepl("^Reach_", safe))     "reach"
+  else                                 "other"
+}
+
+resp_tab <- do.call(rbind, lapply(s5_all_units, function(u) {
+  fc <- tryCatch(load_fitted("conc", u$safe), error = function(e) NULL)
+  if (is.null(fc)) {
+    message("[S5] no cached fit for ", u$safe, " -- skipping (knit 03_mainline.Rmd first)")
+    return(NULL)
+  }
+  mt <- metrics_from_adj(fc$A_glasso, fc$mods_glasso)
+  data.frame(unit    = u$safe,
+             scale   = scale_of(u$safe),
+             n_sites = fc$n_sites,
+             n_comp  = fc$n_comp,
+             edges   = mt$edges,
+             density = round(mt$density, 4),
+             Q       = round(mt$modularity, 4),
+             row.names = NULL)
+}))
+
+## one row per unit: stress axis x network response, inner join on the safe name
+sgh <- if (!is.null(stress_tab) && !is.null(resp_tab))
+  merge(stress_tab, resp_tab, by = "unit") else NULL
+if (!is.null(sgh)) print(sgh)
+```
+
+
+# The test
+
+Three numbers carry the verdict: the **Spearman correlation** between stress
+and Q (the direct analogue of the Hernandez et al. test — rank-based, so robust
+to the skewed stress axis, but unweighted), a **weighted linear model** with
+`n_sites` as weights (large units count more), and the same model with
+**`n_sites` as a covariate** (does the stress slope survive once the mechanical
+n-effect on Q is partialled out?). The unit table and the full model summaries
+are written to `sgh_units.csv` / `sgh_models.txt` under the S5 folder.
+
+```{r s5-test}
+sgh_ok <- !is.null(sgh) && nrow(sgh) >= 5
+if (sgh_ok) {
+  rho_test <- suppressWarnings(cor.test(sgh$Q, sgh$stress_mean,
+                                        method = "spearman", exact = FALSE))
+  lm_w   <- lm(Q ~ stress_mean, data = sgh, weights = n_sites)
+  lm_adj <- lm(Q ~ stress_mean + n_sites, data = sgh, weights = n_sites)
+
+  print(rho_test)
+  print(summary(lm_w))
+  print(summary(lm_adj))
+
+  write.csv(sgh, file.path(out_s5, "sgh_units.csv"), row.names = FALSE)
+  writeLines(c("S5 -- the SGH test: modularity along the stress gradient",
+               sprintf("units: %d   generated: %s", nrow(sgh), Sys.Date()),
+               "",
+               "== Spearman cor.test(Q, stress_mean) ==",
+               capture.output(print(rho_test)),
+               "",
+               "== lm(Q ~ stress_mean, weights = n_sites) ==",
+               capture.output(print(summary(lm_w))),
+               "",
+               "== lm(Q ~ stress_mean + n_sites, weights = n_sites) ==",
+               capture.output(print(summary(lm_adj)))),
+             file.path(out_s5, "sgh_models.txt"))
+} else {
+  message("[S5] fewer than 5 units with both stress and fit -- the test needs more rows; nothing written.")
+}
+```
+
+
+## The figure
+
+```{r s5-figure, results='hide'}
+## [repo 15.09.2026] scatter of the SGH test: stress (x) vs Q (y), colour =
+## spatial scale, size ~ sqrt(n_sites), labels = unit names without their
+## scale prefix. Line = the n_sites-weighted fit. Base graphics, as everywhere
+## in this repo.
+if (sgh_ok) {
+  scale_pal <- c(group = "#264653", basin = "#2A9D8F", section = "#E9C46A", reach = "#9B2226")
+  p_adj <- coef(summary(lm_adj))["stress_mean", "Pr(>|t|)"]
+
+  png(file.path(out_s5, "fig_sgh_scatter.png"), width = 1600, height = 1100, res = 150)
+  par(mar = c(4.8, 4.8, 4.6, 1.2))
+  plot(sgh$stress_mean, sgh$Q,
+       pch = 21, bg = scale_pal[sgh$scale], col = "grey20",
+       cex = 0.5 + sqrt(sgh$n_sites) / 5,
+       xlab = "Stress index (mean sum-TU per site)",
+       ylab = "Modularity Q (glasso, weighted)",
+       main = "Does modularity decline as chemical stress rises?")
+  abline(lm_w, col = "grey30", lty = 2, lwd = 2)
+  text(sgh$stress_mean, sgh$Q,
+       labels = sub("^([A-Za-z]+_)+", "", sgh$unit),
+       pos = 3, cex = 0.6, col = "grey15", xpd = NA)
+  legend("topright", bty = "n", cex = 0.9, title = "Spatial scale",
+         legend = names(scale_pal), pch = 21, pt.bg = scale_pal, col = "grey20")
+  mtext(sprintf("Spearman rho = %.2f (p = %.3g);  n-adjusted stress slope p = %.3g (weighted lm, line = unadjusted weighted fit)",
+                unname(rho_test$estimate), rho_test$p.value, p_adj),
+        side = 3, line = 0.3, cex = 0.8, col = "grey25")
+  dev.off()
+}
+```
+
+
+## Within-basin gradients: sections upstream to downstream
+
+The cross-unit scatter mixes basins that differ in everything (size, land use,
+compound set). The cleaner SGH contrast is *within* one basin: sections ordered
+Upper to Lower form a natural gradient, and the two panels below trace stress
+and Q along it, one line per basin.
+
+```{r s5-section-panel, results='hide'}
+## [repo 15.09.2026] sections ordered Upper -> Middle -> Lower (make_sections()
+## in 01_data.R already orients "Upper" upstream per basin, splitting the Elbe
+## and Rhine by latitude and the Danube by longitude). Only basins with >= 2
+## sections can show a gradient at all.
+pos_rank <- c(Upper = 1, Middle = 2, Lower = 3)
+sec_by_basin <- split(section_units, vapply(section_units, `[[`, character(1), "basin"))
+sec_by_basin <- Filter(function(x) length(x) >= 2, sec_by_basin)
+
+if (sgh_ok && length(sec_by_basin)) {
+  pd <- do.call(rbind, lapply(names(sec_by_basin), function(bn) {
+    do.call(rbind, lapply(sec_by_basin[[bn]], function(u) {
+      i <- match(u$safe, sgh$unit)
+      if (is.na(i)) return(NULL)
+      pos <- sub("^Sec_[A-Za-z0-9]+_", "", u$safe)
+      data.frame(basin = bn, pos = pos, pos_i = unname(pos_rank[pos]),
+                 stress = sgh$stress_mean[i], Q = sgh$Q[i], row.names = NULL)
+    }))
+  }))
+
+  if (!is.null(pd) && nrow(pd)) {
+    basin_cols <- c(Elbe = "#457B9D", Danube = "#2A9D8F", Rhine = "#E9C46A")
+    col_of <- function(bn) if (bn %in% names(basin_cols)) basin_cols[[bn]] else "grey40"
+
+    png(file.path(out_s5, "fig_sgh_within_basin.png"), width = 1800, height = 900, res = 150)
+    par(mfrow = c(1, 2), mar = c(4.8, 4.8, 4, 1.2), oma = c(0, 0, 2.5, 0))
+    for (pan in c("stress", "Q")) {
+      yl <- range(pd[[pan]], na.rm = TRUE)
+      if (diff(yl) == 0) yl <- yl + c(-0.5, 0.5)   # flat line still needs a finite window
+      yl <- yl + c(-1, 1) * 0.08 * diff(yl)
+      plot(NA, xlim = c(0.7, 3.3), ylim = yl, xaxt = "n",
+           xlab = "River position (upstream to downstream)",
+           ylab = if (pan == "stress") "Stress index (mean sum-TU per site)" else "Modularity Q (glasso)",
+           main = if (pan == "stress") "(a) stress along the river" else "(b) modularity along the river")
+      axis(1, at = 1:3, labels = c("Upper", "Middle", "Lower"))
+      for (bn in unique(pd$basin)) {
+        d <- pd[pd$basin == bn, ]
+        d <- d[order(d$pos_i), ]
+        lines(d$pos_i, d[[pan]], col = col_of(bn), lwd = 2)
+        points(d$pos_i, d[[pan]], pch = 21, bg = col_of(bn), col = "grey20", cex = 1.6)
+      }
+      legend("topright", bty = "n", cex = 0.9, legend = unique(pd$basin),
+             col = sapply(unique(pd$basin), col_of), pch = 19, lty = 1)
+    }
+    mtext("Within-basin gradient: river sections ordered upstream to downstream",
+          outer = TRUE, cex = 1.05, font = 2)
+    dev.off()
+  }
+}
+```
+
+
+## Module stability under site resampling
+
+A gradient claim built on a partition that dissolves when 20 % of sites are
+dropped would not survive review, so every basin partition gets a stability
+number first: refit the glasso network on R = 25 site subsamples and report the
+ARI of each subsample partition against the full-data partition.
+
+```{r s5-module-stability, results='hide'}
+## [repo 15.09.2026] SLOW: R = 25 glasso+StARS refits per basin on top of the
+## full-data fit (~1-2 min per basin at rep.num = 20).
+stab_tab <- do.call(rbind, lapply(basin_units, function(u) {
+  ## safe = u$safe -> reference partition is the cached MAINLINE fit (StARS
+  ## rep.num = 100), i.e. the partition the thesis reports, not a shallow refit
+  bs <- tryCatch(bootstrap_module_stability("conc", u$site_ids, R = 25, rep.num = 20,
+                                            safe = u$safe),
+                 error = function(e) { message("[S5] stability bootstrap failed for ", u$safe,
+                                               ": ", conditionMessage(e)); NULL })
+  if (is.null(bs)) return(NULL)
+  data.frame(unit = u$safe, mean_ari = round(bs$mean_ari, 3), sd_ari = round(bs$sd_ari, 3),
+             R_done = bs$R_done, row.names = NULL)
+}))
+if (!is.null(stab_tab)) {
+  write.csv(stab_tab, file.path(out_s5, "module_stability_bootstrap.csv"), row.names = FALSE)
+  print(stab_tab)
+}
+```
+
+How to read the table: an ARI near 1 means the same partition is recovered
+under site resampling — the modules are a property of the data, not of which
+sites happened to be sampled; values well below 1 mean the partition sits on
+the degenerate plateau of near-optimal solutions (Good et al. 2010) and
+module-level claims for that basin should be read accordingly.
+
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
