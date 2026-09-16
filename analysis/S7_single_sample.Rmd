@@ -1,0 +1,165 @@
+---
+title: "S7 — Single-site networks: LIONESS / BONOBO and the per-site SGH test"
+subtitle: "Per-site partial-correlation networks (LIONESS-over-glasso) and marginal networks with uncertainty (BONOBO), turning the unit-level SGH test into Hernandez et al.'s per-site design."
+author: "Robert Neugebauer (vRN)"
+date: "15.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r split-source, message=FALSE}
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+source(file.path(sp, "11_single_sample_vRN.R"))
+out_s7 <- file.path(outroot, "single_sample"); dir.create(out_s7, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Rationale (read me first)
+
+S5 tests the SGH at the **unit** level (one Q per unit vs mean sum-TU) because
+the pipeline's smallest object is a group of sites. But Hernandez et al. (2021,
+ISME J 15:1722) — the paper the SGH framing comes from — run the test **per
+site**: the modularity of each site's network against that site's stress rank.
+This supplement builds per-site networks so that test can be run as they ran it,
+with n in the hundreds instead of ~21 units.
+
+**What a single-site network is — and is not.** A PANGAEA site is one grab
+sample: a single observation. You cannot estimate covariance between two
+compounds from one observation, so a single-site network is **not** "the
+associations at this site" — it is that site's *contribution to / perturbation
+of* the shared cross-site network. Read it as a per-site readout against the
+population, not an intrinsic site network.
+
+**Two methods, deliberately complementary.**
+
+* **LIONESS-over-glasso** — per-site **partial-correlation** networks. Keeps the
+  conditioning that is the whole reason this project uses glasso, so the
+  pollution/dilution gradient stays conditioned out. lambda is selected **once**
+  on the full unit and held fixed across every leave-one-out. This is the
+  network for the per-site SGH test.
+* **BONOBO** (faithful `netZooPy` port) — per-site **marginal** correlation
+  networks **with a closed-form per-edge uncertainty**. Marginal, so it does not
+  condition out the gradient — used here as a cross-check and for per-edge
+  confidence, not as the primary SGH network.
+
+**One honest caveat, built into the test.** Every LIONESS site network shares
+the aggregate, so the per-site networks are highly correlated by construction;
+`sgh_persite()` therefore uses a **stress-label permutation null**, never
+parametric p-values, and reports a magnitude control (Q partialled on edge
+count) because a Q–stress slope that is really a density effect is not modular
+reorganisation.
+
+# Choose units
+
+```{r s7-config}
+## Default to the whole basins (largest n -> most per-site power). Add/replace
+## with section_units or reach_units as needed. LIONESS does N leave-one-out
+## glasso fits per unit at FIXED lambda (fast, no StARS); BONOBO is closed-form.
+s7_units <- basin_units
+S7_KIND  <- "conc"     # co-occurrence structure lives in the concentration networks
+message("[S7] units: ", paste(sapply(s7_units, `[[`, "safe"), collapse = ", "))
+```
+
+# LIONESS: per-site partial-correlation networks + the per-site SGH test
+
+```{r s7-lioness, message=TRUE}
+lioness_out <- list()
+for (u in s7_units) {
+  pu <- tryCatch(prep_unit(S7_KIND, u$site_ids), error = function(e) NULL)
+  if (is.null(pu) || pu$n_sites < 8 || pu$n_comp < 5) { message("[S7] skip ", u$safe); next }
+  message("[S7] LIONESS ", u$safe, " (", pu$n_sites, " sites x ", pu$n_comp, " compounds)")
+  ss  <- lioness_glasso(pu, verbose = FALSE)          # heavy step; see async note below
+  met <- single_site_metrics(ss, stress = site_stress(u$site_ids))
+  met$unit <- u$safe
+  utils::write.csv(met, file.path(out_s7, paste0("lioness_persite_", u$safe, ".csv")), row.names = FALSE)
+  lioness_out[[u$safe]] <- list(ss = ss, met = met, sgh = sgh_persite(met))
+}
+
+## per-site SGH verdict, one row per unit
+sgh_tab <- do.call(rbind, lapply(names(lioness_out), function(nm) {
+  s <- lioness_out[[nm]]$sgh
+  data.frame(unit = nm, n = s$n %||% NA, rho = s$rho %||% NA, p_perm = s$p_perm %||% NA,
+             rho_partial_given_edges = s$rho_partial_given_edges %||% NA,
+             direction = s$sgh_direction %||% NA, stringsAsFactors = FALSE)
+}))
+print(sgh_tab, row.names = FALSE)
+if (nrow(sgh_tab)) utils::write.csv(sgh_tab, file.path(out_s7, "lioness_sgh_persite.csv"), row.names = FALSE)
+```
+
+```{r s7-lioness-fig, fig.width=10, fig.height=4.5}
+## Q vs stress per unit, with the permutation rho/p in the subtitle.
+if (length(lioness_out)) {
+  op <- graphics::par(mfrow = c(1, min(3, length(lioness_out))), mar = c(4.5, 4.5, 3.5, 1))
+  for (nm in names(lioness_out)) {
+    d <- lioness_out[[nm]]$met; s <- lioness_out[[nm]]$sgh
+    d <- d[is.finite(d$Q) & is.finite(d$stress), ]
+    plot(log10(d$stress), d$Q, pch = 19, col = "#457B9D",
+         xlab = "log10 site sum-TU (stress)", ylab = "Modularity Q (LIONESS)", main = nm)
+    if (nrow(d) > 2) graphics::abline(lm(Q ~ log10(stress), d), col = "#CC071E", lwd = 2)
+    graphics::mtext(sprintf("Spearman rho = %.2f  (perm p = %.3g)", s$rho %||% NA, s$p_perm %||% NA),
+                    side = 3, line = 0.2, cex = 0.8)
+  }
+  graphics::par(op)
+}
+```
+
+# BONOBO: per-site marginal networks with per-edge uncertainty (cross-check)
+
+```{r s7-bonobo, message=TRUE}
+bonobo_out <- list()
+for (u in s7_units) {
+  pu <- tryCatch(prep_unit(S7_KIND, u$site_ids), error = function(e) NULL)
+  if (is.null(pu) || pu$n_sites < 8 || pu$n_comp < 5) next
+  bb  <- bonobo_all(pu, sparsify = TRUE, confidence = 0.05, verbose = FALSE)   # z-thresholded -> topology-ready
+  met <- single_site_metrics(list(agg = NULL, single = bb$single), stress = site_stress(u$site_ids))
+  met$unit <- u$safe
+  utils::write.csv(met, file.path(out_s7, paste0("bonobo_persite_", u$safe, ".csv")), row.names = FALSE)
+  bonobo_out[[u$safe]] <- list(bb = bb, met = met, sgh = sgh_persite(met))
+}
+bsgh <- do.call(rbind, lapply(names(bonobo_out), function(nm) {
+  s <- bonobo_out[[nm]]$sgh
+  data.frame(unit = nm, rho = s$rho %||% NA, p_perm = s$p_perm %||% NA,
+             direction = s$sgh_direction %||% NA, stringsAsFactors = FALSE)
+}))
+if (nrow(bsgh)) { print(bsgh, row.names = FALSE)
+  utils::write.csv(bsgh, file.path(out_s7, "bonobo_sgh_persite.csv"), row.names = FALSE) }
+```
+
+Agreement between the LIONESS (partial) and BONOBO (marginal) per-site SGH
+directions is the useful read: if both point the same way, the per-site signal
+is not an artefact of one estimator's conditioning choice; if they disagree, the
+gradient likely lives in the marginal correlations that glasso conditions out —
+itself informative.
+
+# Site idiosyncrasy: distance from the basin network
+
+```{r s7-distance, fig.width=6, fig.height=4.5}
+## LIONESS gives a per-site distance from the aggregate (how idiosyncratic this
+## site's chemical structure is vs its basin). Does idiosyncrasy rise with stress?
+dist_all <- do.call(rbind, lapply(names(lioness_out), function(nm) lioness_out[[nm]]$met))
+if (!is.null(dist_all) && any(is.finite(dist_all$dist_cor))) {
+  d <- dist_all[is.finite(dist_all$dist_cor) & is.finite(dist_all$stress), ]
+  plot(log10(d$stress), d$dist_cor, pch = 19, col = "#2A9D8F",
+       xlab = "log10 site sum-TU (stress)", ylab = "1 - cor(site, aggregate)  [idiosyncrasy]",
+       main = "Does the site network diverge from its basin as stress rises?")
+  if (nrow(d) > 2) {
+    graphics::abline(lm(dist_cor ~ log10(stress), d), col = "#CC071E", lwd = 2)
+    rho <- suppressWarnings(stats::cor(d$dist_cor, d$stress, method = "spearman"))
+    graphics::mtext(sprintf("Spearman rho = %.2f", rho), side = 3, line = 0.2, cex = 0.85)
+  }
+}
+```
+
+# Performance note
+
+The LIONESS loops are the only heavy part (N leave-one-out glasso fits per unit;
+BONOBO is closed-form and near-instant). For the largest basins run them as a
+background job via the RStudio MCP async tools — `execute_r_async`, poll with
+`get_async_result` — and save each `lioness_out[[unit]]$ss` to disk with
+`saveRDS` rather than holding every site network in memory at once.
