@@ -9,9 +9,7 @@ turned into a sparse **partial-correlation network** per spatial unit (graphical
 StARS-selected), partitioned into modules, and tested against degree-preserving null
 models. Toxicological risk is overlaid as a second, independent node attribute.
 
-MSc thesis, Robert Neugebauer. Supervisor: Pedro Inostroza. Builds on P. A. Inostroza's
-vPI3 workflow.
-
+MSc thesis, Robert Neugebauer. Supervisor: Pedro Inostroza - Co-Superivsor: Prof. Michael Schaub
 ## Layout
 
 ```
@@ -72,9 +70,9 @@ supplementary is whatever defends a choice.**
 ## Quick start
 
 ```r
-Sys.setenv(SGH_PROJ = "C:/path/to/your/R")   # where the data lives
+Sys.setenv(SGH_PROJ = "C:/path/to/your/R")   # Data path
 setwd("path/to/sgh-chemical-networks")
-source("run_all.R")                          # edit STEPS at the top to pick what runs
+source("run_all.R")                          # Edit and set which steps run at the top 
 ```
 
 Or load the foundation and work interactively:
@@ -86,20 +84,18 @@ source("R/00_setup.R"); source("R/01_data.R"); source("R/02_functions.R")
 Verify the checkout runs (synthetic data, no downloads, needs only igraph + huge):
 
 ```r
-source("tests/smoke_test.R")   # or: Rscript tests/smoke_test.R
+source("tests/smoke_test.R")   # "Smoke tests" for Quality control 
 ```
 
-## Reproducibility
+## To-Do: Reproducibility
 
-Package versions are not yet pinned by a lockfile. To create one after installing
-the dependencies, run once from the repo root:
+Create a lockfile -> To store Package versions after installing
+
+To-Do: run once from the repo root:
 
 ```r
 install.packages("renv"); renv::init()   # writes renv.lock -- commit it
 ```
-
-Every pipeline run already writes `run_manifest.json` (parameters, package
-versions, git commit) into the output tree.
 
 ## Method Summary
 
@@ -109,21 +105,22 @@ compound is accounted for, so the shared pollution gradient does not manufacture
 With more compounds than sites the partial-correlation matrix cannot be inverted
 directly, so the **graphical lasso** estimates a regularised version and **StARS**
 picks the penalty by edge stability across site resamples. Modules are found by greedy
-modularity maximisation; an edge-level test over ~18,500 compound pairs per basin shows
+modularity maximisation (fast_greedy algorhythm); an edge-level test over ~18,500 compound pairs per basin shows
 they are **emission-source** compartments, not mechanistic ones.
 
-## On the null model
+## On the null model ~ statistical significance approximation
 
 Newman's Q already contains a configuration-model expectation (`k_i*k_j/2m`), so an
 external null ensemble must preserve degrees to test the same hypothesis the statistic
-assumes. `null_test_multi()` therefore reports **config** and **Chung-Lu** first and
-Erdos-Renyi last. This is not cosmetic: **8 of 17 units change verdict depending on the
+assumes. 
+Swapped to `null_test_multi()` to report **config** and **Chung-Lu** (degree-preserving) first and
+Erdos-Renyi (non degree-preserving) last. This change has a strong impact: **8 of 17 units change verdict depending on the
 null, and 5 flip sign.** -> Use config in the main text and keep ER for average path length,
 where it is the conventional reference.
 
 Change the null in one place -- the `nulls =` argument in `analysis/03_mainline.Rmd`.
 
-## Code Structure
+## Code Structure WIP - highlight important code chunks
 
 ```r
 source("R/highlights_vRN.R")
