@@ -1,7 +1,8 @@
-# sgh-chemical-networks
+# Chemical-networks
 
-Chemical co-occurrence networks in European rivers, used to test the **Stress Gradient
-Hypothesis** (SGH): does modular network organisation decline along a stress gradient?
+Chemical co-occurrence networks in European rivers, the **Stress Gradient
+Hypothesis** (SGH) was used as an entry point (methodology used on microbial community was ported to abiotic interactions):
+does modular network organisation decline along a stress gradient?
 
 Measured concentrations of ~600 compounds at sites in the Elbe, Rhine and Danube are
 turned into a sparse **partial-correlation network** per spatial unit (graphical lasso,
@@ -100,7 +101,7 @@ install.packages("renv"); renv::init()   # writes renv.lock -- commit it
 Every pipeline run already writes `run_manifest.json` (parameters, package
 versions, git commit) into the output tree.
 
-## Method in one paragraph
+## Method Summary
 
 Two chemicals correlate across sites mostly because some sites are polluted and some
 are clean. A **partial** correlation asks whether they still co-vary once every other
@@ -117,12 +118,12 @@ Newman's Q already contains a configuration-model expectation (`k_i*k_j/2m`), so
 external null ensemble must preserve degrees to test the same hypothesis the statistic
 assumes. `null_test_multi()` therefore reports **config** and **Chung-Lu** first and
 Erdos-Renyi last. This is not cosmetic: **8 of 17 units change verdict depending on the
-null, and 5 flip sign.** Quote config in the main text; keep ER for average path length,
+null, and 5 flip sign.** -> Use config in the main text and keep ER for average path length,
 where it is the conventional reference.
 
 Change the null in one place -- the `nulls =` argument in `analysis/03_mainline.Rmd`.
 
-## Finding your way around the code
+## Code Structure
 
 ```r
 source("R/highlights_vRN.R")
