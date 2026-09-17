@@ -1,0 +1,362 @@
+---
+title: "S7 -- Site-level stress-gradient tests"
+subtitle: "Pooled inference, an external pressure proxy (UDF), trivial-score benchmarks and permutation nulls for the S6 single-site networks."
+author: "Robert Neugebauer (vRN)"
+date: "16.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r knitr-opts, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 9)
+```
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded AND that
+## S6 has run (its per-site summary tables are the input). Repo-relative.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+source(file.path(sp, "05_lioness.R"))
+```
+
+
+# Rationale (read me first)
+
+S6 produced one network **per site** and summarised each on the aggregate StARS
+skeleton (`strength_skeleton`). The headline readout was a per-unit Spearman ρ
+between per-site strength and per-site stress (sum-TU): 13 of 17 units negative
+for BONOBO. That leaves four questions open, and S7 answers all four:
+
+1. **Pooled inference.** "13/17 negative" is not a p-value. S7 combines the 17
+   per-unit tests (Stouffer's method on Fisher-z) and, more importantly, builds
+   a **permutation null** (sum-TU shuffled within each unit) for the sign
+   count, the median ρ and the combined Z — no distributional assumptions.
+2. **Circularity.** sum-TU is computed from the SAME concentration matrix as
+   the networks, so "strength ~ sum-TU" has a built-in coupling. The PANGAEA
+   site sheet carries an **external** pressure variable the mainline never
+   uses: the **urban discharge fraction (UDF)**, a hydrological estimate of the
+   wastewater share of a site's discharge. It is not derived from the measured
+   concentrations, so "strength ~ UDF" is a circularity-free version of the
+   same question. (Stream order is kept as a hydrological covariate.)
+3. **Trivial-score benchmark.** A site's skeleton strength could just track how
+   much was detected there at all. S7 recomputes the association as a
+   **partial Spearman** given the site's detection count and mean
+   log-concentration, and fits a joint model with both trivial scores.
+4. **Biomarker test.** For a monitoring tool, strength must explain an
+   EXTERNAL outcome beyond what sum-TU already explains. S7 tests whether
+   adding strength to `UDF ~ log(1 + sum-TU)` improves the fit (F-test).
+
+Two modelling notes. First, sum-TU is extremely right-skewed and a handful of
+sites (e.g. Elbe EUS_029, sum-TU = 276) have enormous OLS leverage — pooled
+fixed-effects slopes can flip sign against the rank correlation because of
+them. S7 therefore reports both the basin-fixed-effects OLS (with
+cluster-robust SEs) and a Huber-robust fit, and treats the rank-based and
+permutation tests as primary. Second, per-site strengths are only comparable
+WITHIN a unit (each unit has its own skeleton), so all pooled models
+z-standardise strength within basin and include basin fixed effects.
+
+
+## Parameters
+
+```{r s7-params}
+S7_NPERM   <- 5000L   # permutation draws for the null distributions
+S7_MIN_UDF <- 10L     # minimum sites with UDF for a per-basin UDF test
+S7_SEED    <- 42L
+```
+
+
+## Per-site analysis table
+
+```{r s7-table}
+## [S7] start from the S6 master table when present; otherwise rebuild the
+## per-site summaries from the cached single-site nets + aggregate skeletons.
+master_file <- file.path(outroot, "master_single_networks.csv")
+if (file.exists(master_file)) {
+  s6_master <- read.csv(master_file, stringsAsFactors = FALSE)
+} else {
+  s6_units <- c(units, basin_units, section_units)
+  s6_master <- do.call(rbind, lapply(s6_units, function(u) {
+    fit <- load_fitted("conc", u$safe)
+    bo  <- load_single_nets("conc", u$safe, "bonobo")
+    li  <- load_single_nets("conc", u$safe, "lioness")
+    if (is.null(fit) || is.null(bo) || is.null(li)) return(NULL)
+    pu  <- prep_unit("conc", u$site_ids)
+    per_u <- do.call(rbind, list(
+      cbind(method = "bonobo",  single_site_summary(bo$nets, fit$A_glasso, fit$mods_glasso)),
+      cbind(method = "lioness", single_site_summary(li$nets, fit$A_glasso, fit$mods_glasso))))
+    per_u$kind <- "conc"; per_u$unit <- u$safe; per_u$label <- u$label
+    per_u
+  }))
+}
+
+bon <- subset(s6_master, method == "bonobo")
+lio <- subset(s6_master, method == "lioness",
+              select = c(unit, site, strength_skeleton))
+names(lio)[3] <- "strength_lioness"
+s7 <- merge(bon, lio, by = c("unit", "site"), all.x = TRUE)
+
+## site stress + external covariates
+sum_tu <- if (ncol(tu_mat) > 0) colSums(tu_mat) else setNames(rep(NA_real_, ncol(conc_mat)), colnames(conc_mat))
+s7$sum_tu <- sum_tu[s7$site]
+
+## [S7] UDF and stream order sit in sites_meta under their original xlsx names
+## (01_data.R renames only the five columns the mainline needs).
+udf_col <- "Urban discharge fraction (UDF)"
+so_col  <- "Stream order by Strahler"
+meta <- as.data.frame(sites_meta)
+s7$UDF          <- as.numeric(meta[match(s7$site, meta$site_id), udf_col])
+s7$stream_order <- as.numeric(meta[match(s7$site, meta$site_id), so_col])
+s7$basin        <- meta[match(s7$site, meta$site_id), "river_basin"]
+
+## trivial per-site scores over the SAME global node pool the networks use:
+## detection count and mean log10(MDL/2-floored) concentration.
+pool <- KEEP_GLOBAL$conc
+sub_pool <- conc_mat[pool, , drop = FALSE]
+fl <- sub_pool
+is_zero <- fl == 0
+fl[is_zero] <- matrix(mdl_half_ngL[pool], nrow = length(pool), ncol = ncol(fl))[is_zero]
+logf <- log10(fl)
+s7$n_det    <- colSums(sub_pool > 0)[s7$site]
+s7$mean_log <- colMeans(logf)[s7$site]
+
+write.csv(s7, file.path(outroot, "tableS7_site_table.csv"), row.names = FALSE)
+message("[S7] site table: ", nrow(s7), " site x unit rows; UDF available for ",
+        sum(!is.na(s7$UDF)), " of them")
+```
+
+
+## Pooled inference and the permutation null
+
+```{r s7-global}
+## [S7] the 17 per-unit Spearman rhos (BONOBO) come straight from the table;
+## the null shuffles sum-TU WITHIN each unit, so unit size, skeleton and the
+## stress distribution are all preserved -- only the pairing is broken.
+set.seed(S7_SEED)
+units17 <- sort(unique(s7$unit))
+fast_rho <- function(ry, x) {           # Spearman via Pearson on ranks
+  rx <- rank(x, ties.method = "average")
+  cor(ry, rx)
+}
+ranks_y <- lapply(units17, function(u) rank(s7$strength_skeleton[s7$unit == u], ties.method = "average"))
+x_vals  <- lapply(units17, function(u) s7$sum_tu[s7$unit == u])
+ns      <- vapply(x_vals, length, integer(1))
+obs_rho <- mapply(fast_rho, ranks_y, x_vals)
+
+null_rhos <- replicate(S7_NPERM,
+  mapply(function(ry, x) fast_rho(ry, sample(x)), ranks_y, x_vals))  # 17 x NPERM
+## [S7-fix 17.09.2026] replicate() simplifies to a plain vector when only ONE
+## unit is analysed (subset runs, smoke tests) -- force the 17 x NPERM matrix
+## shape explicitly. Column-major fill matches replicate(), so this is a
+## no-op for the full 17-unit table.
+null_rhos <- matrix(null_rhos, nrow = length(units17))
+p_emp <- rowMeans(abs(null_rhos) >= abs(obs_rho))
+
+stouffer <- function(rhos, n) {
+  z <- atanh(pmax(pmin(rhos, .999), -.999)) * sqrt(n - 3)
+  sum(z) / sqrt(length(rhos))
+}
+obs_stats  <- c(neg = sum(obs_rho < 0), med = median(obs_rho), Z = stouffer(obs_rho, ns))
+null_stats <- rbind(neg = colSums(null_rhos < 0),
+                    med = apply(null_rhos, 2, median),
+                    Z   = apply(null_rhos, 2, stouffer, n = ns))
+p_neg <- mean(null_stats["neg", ] >= obs_stats["neg"])
+p_med <- mean(null_stats["med", ] <= obs_stats["med"])
+p_Z   <- mean(null_stats["Z", ]   <= obs_stats["Z"])
+p_Z_normal <- 2 * pnorm(-abs(obs_stats["Z"]))
+
+## LIONESS sensitivity: same Stouffer combination on the S6 rho table
+rho_lio <- vapply(units17, function(u)
+  cor(s7$strength_lioness[s7$unit == u], s7$sum_tu[s7$unit == u], method = "spearman"), numeric(1))
+Z_lio <- stouffer(rho_lio, ns)
+
+per_unit <- data.frame(unit = units17, n_sites = ns,
+                       rho_bonobo = round(obs_rho, 3), p_emp_bonobo = round(p_emp, 4),
+                       rho_lioness = round(rho_lio, 3), row.names = NULL)
+write.csv(per_unit, file.path(outroot, "tableS7_per_unit_permutation.csv"), row.names = FALSE)
+
+global_tests <- data.frame(
+  test = c("sign count negative (bonobo)", "median rho (bonobo)",
+           "Stouffer Z (bonobo)", "Stouffer Z (bonobo)", "Stouffer Z (lioness)"),
+  statistic = round(c(obs_stats["neg"], obs_stats["med"], obs_stats["Z"], obs_stats["Z"], Z_lio), 4),
+  p_value   = signif(c(p_neg, p_med, p_Z_normal, p_Z, 2 * pnorm(-abs(Z_lio))), 3),
+  method    = c("permutation", "permutation", "normal theory", "permutation", "normal theory"),
+  row.names = NULL)
+write.csv(global_tests, file.path(outroot, "tableS7_global_tests.csv"), row.names = FALSE)
+print(global_tests)
+```
+
+## External pressure proxy (UDF) and the biomarker test
+
+```{r s7-external}
+## [S7] basin units only (each site appears exactly once). UDF is missing for
+## part of the sites; per-basin tests need S7_MIN_UDF covered sites.
+B <- s7[grepl("^Basin_", s7$unit), ]
+B$z_strength <- ave(B$strength_skeleton, B$basin, FUN = function(s) as.numeric(scale(s)))
+B$log_tu     <- log1p(B$sum_tu)
+U <- B[!is.na(B$UDF), ]
+
+udf_rows <- do.call(rbind, lapply(split(U, U$basin), function(d) {
+  if (nrow(d) < S7_MIN_UDF) return(NULL)
+  data.frame(basin = d$basin[1], n = nrow(d),
+             rho_bonobo_strength_UDF  = round(cor(d$strength_skeleton, d$UDF, method = "spearman"), 3),
+             p_bonobo  = signif(cor.test(d$strength_skeleton, d$UDF, method = "spearman")$p.value, 3),
+             rho_lioness_strength_UDF = round(cor(d$strength_lioness, d$UDF, method = "spearman"), 3),
+             p_lioness = signif(cor.test(d$strength_lioness, d$UDF, method = "spearman")$p.value, 3),
+             rho_UDF_sumTU = round(cor(d$UDF, d$sum_tu, method = "spearman"), 3),
+             row.names = NULL)
+}))
+write.csv(udf_rows, file.path(outroot, "tableS7_external_proxy_UDF.csv"), row.names = FALSE)
+print(udf_rows)
+
+## pooled within-basin models: OLS with basin fixed effects AND Huber-robust --
+## the two disagree exactly when a few extreme sites drive the OLS slope.
+fe_ols <- lm(z_strength ~ log_tu + basin, data = B)
+fe_rlm <- MASS::rlm(z_strength ~ log_tu + basin, data = B)
+t_rlm  <- summary(fe_rlm)$coefficients["log_tu", "t value"]
+cat(sprintf("[S7] pooled slope log(1+sum-TU):  OLS %+.4f (p %.3f)   Huber %+.4f (p %.3f)\n",
+            coef(fe_ols)["log_tu"], summary(fe_ols)$coefficients["log_tu", 4],
+            coef(fe_rlm)["log_tu"], 2 * pnorm(-abs(t_rlm))))
+
+## BIOMARKER TEST: does strength explain the EXTERNAL proxy beyond sum-TU?
+Ub <- U[U$basin %in% udf_rows$basin[udf_rows$n >= 30], ]   # adequate coverage
+Ub$z_udf <- ave(Ub$UDF, Ub$basin, FUN = function(s) as.numeric(scale(s)))
+m0 <- lm(z_udf ~ log_tu + basin, data = Ub)
+m1 <- lm(z_udf ~ log_tu + z_strength + basin, data = Ub)
+biomarker <- anova(m0, m1)
+cat(sprintf("[S7] biomarker test (UDF ~ log_tu vs + strength): F = %.2f, p = %.3f\n",
+            biomarker$F[2], biomarker$`Pr(>F)`[2]))
+```
+
+
+## Trivial-score benchmark
+
+```{r s7-benchmark}
+## [S7] partial Spearman (rank-residual method): is the strength--stress
+## association just "sites with more detections have stronger networks"?
+partial_spearman <- function(d, y, x, covs) {
+  rres <- function(v) {
+    X <- model.matrix(~ ., data = as.data.frame(lapply(d[covs], rank)))[, -1]
+    residuals(lm(rank(v) ~ X))
+  }
+  cor(rres(d[[y]]), rres(d[[x]]), method = "spearman")
+}
+bench <- do.call(rbind, lapply(split(B, B$basin), function(d) {
+  data.frame(basin = d$basin[1], n = nrow(d),
+             raw_rho = round(cor(d$strength_skeleton, d$sum_tu, method = "spearman"), 3),
+             partial_rho_given_trivial = round(
+               partial_spearman(d, "strength_skeleton", "sum_tu", c("n_det", "mean_log")), 3),
+             row.names = NULL)
+}))
+write.csv(bench, file.path(outroot, "tableS7_benchmark_biomarker.csv"), row.names = FALSE)
+print(bench)
+```
+
+
+## Figure
+
+```{r s7-figure, results='hide'}
+png(file.path(outroot, "figS7_site_level_tests.png"), width = 2300, height = 1650, res = 150)
+par(mfrow = c(2, 2), mar = c(4.6, 9.5, 3.4, 1), oma = c(0, 0, 2.5, 0))
+
+## (a) forest plot with permutation null envelope
+ord <- order(obs_rho)
+lo <- apply(null_rhos, 1, quantile, 0.025); hi <- apply(null_rhos, 1, quantile, 0.975)
+plot(NA, xlim = range(lo, hi, obs_rho), ylim = c(0.5, 17.5), yaxt = "n",
+     xlab = "Spearman rho: per-site network strength vs site sum-TU", ylab = "",
+     main = "(a) per-unit rho with permutation null envelope")
+axis(2, at = seq_along(units17), labels = units17[ord], las = 1, cex.axis = 0.75)
+segments(lo[ord], seq_along(units17), hi[ord], seq_along(units17), col = "grey85", lwd = 5, lend = 1)
+abline(v = 0, col = "grey60")
+sig <- p_emp[ord] < 0.05
+points(obs_rho[ord], seq_along(units17), pch = 21, cex = 1.3,
+       bg = ifelse(sig, "#2A9D8F", adjustcolor("#2A9D8F", alpha.f = 0.35)),
+       col = ifelse(sig, "black", "grey50"))
+legend("bottomright", bty = "n", cex = 0.8,
+       legend = c("perm. p < 0.05", "n.s.", "95% null range"),
+       pch = c(21, 21, NA), pt.bg = c("#2A9D8F", adjustcolor("#2A9D8F", alpha.f = 0.35), NA),
+       col = c("black", "grey50", "grey85"), lwd = c(NA, NA, 5))
+
+## (b) estimator bracketing
+par(mar = c(4.6, 4.8, 3.4, 1))
+plot(obs_rho, rho_lio, pch = 19, col = "#9B2226",
+     xlab = "BONOBO rho", ylab = "LIONESS rho",
+     main = "(b) the two estimators bracket -- and disagree")
+abline(h = 0, v = 0, col = "grey75"); abline(0, 1, lty = 3, col = "grey75")
+
+## (c) external proxy
+basins3 <- udf_rows$basin[udf_rows$n >= 30]
+cols3   <- setNames(c("#457B9D", "#E63946", "#2A9D8F"), basins3)
+plot(NA, xlim = range(U$UDF[U$basin %in% basins3]), ylim = range(U$z_strength[U$basin %in% basins3]),
+     xlab = "urban discharge fraction UDF (%)", ylab = "skeleton strength (z within basin)",
+     main = "(c) circularity check: strength vs UDF (external)")
+for (bn in basins3) {
+  d <- U[U$basin == bn, ]
+  points(d$UDF, d$z_strength, pch = 19, cex = 0.7, col = adjustcolor(cols3[bn], alpha.f = 0.55))
+}
+abline(h = 0, col = "grey75")
+legend("topright", bty = "n", cex = 0.85,
+       legend = sprintf("%s (rho=%+.2f)", basins3,
+                        vapply(basins3, function(bn)
+                          cor(U$strength_skeleton[U$basin == bn], U$UDF[U$basin == bn],
+                              method = "spearman"), numeric(1))),
+       col = cols3, pch = 19)
+
+## (d) raw vs partial rho
+plot(NA, xlim = c(0.5, nrow(bench) + 0.5), ylim = range(bench$raw_rho, bench$partial_rho_given_trivial, 0),
+     xaxt = "n", xlab = "", ylab = "Spearman rho (strength vs sum-TU)",
+     main = "(d) benchmark against trivial per-site scores")
+axis(1, at = seq_len(nrow(bench)), labels = bench$basin, cex.axis = 0.8)
+abline(h = 0, col = "grey60")
+segments(seq_len(nrow(bench)) - 0.12, bench$raw_rho,
+         seq_len(nrow(bench)) + 0.12, bench$partial_rho_given_trivial, col = "grey75")
+points(seq_len(nrow(bench)) - 0.12, bench$raw_rho, pch = 19, col = "#2A9D8F", cex = 1.4)
+points(seq_len(nrow(bench)) + 0.12, bench$partial_rho_given_trivial, pch = 15, col = "#264653", cex = 1.4)
+legend("bottomleft", bty = "n", cex = 0.85,
+       legend = c("raw rho", "partial rho | detection count, mean conc."),
+       pch = c(19, 15), col = c("#2A9D8F", "#264653"))
+
+mtext("S7 -- site-level stress-gradient tests (pooled inference, external proxy, benchmarks, permutation nulls)",
+      outer = TRUE, cex = 1.15, font = 2)
+dev.off()
+```
+
+
+## How to read the output
+
+- `tableS7_per_unit_permutation.csv` — per-unit BONOBO rho with its
+  permutation p-value, plus the LIONESS rho for the same unit.
+- `tableS7_global_tests.csv` — the pooled evidence: sign count, median rho and
+  Stouffer Z with permutation and normal-theory p-values. Read the
+  **permutation** p-values; the Stouffer Z is significant and NEGATIVE for
+  BONOBO but significant and POSITIVE for LIONESS — the estimators bracket the
+  answer, which is why S6 reports both.
+- `tableS7_external_proxy_UDF.csv` — the circularity-free version: strength vs
+  the urban discharge fraction, per basin. UDF is not derived from the
+  concentration data, so a negative rho there cannot be a mechanical coupling.
+- `tableS7_benchmark_biomarker.csv` — raw vs partial rho given the trivial
+  per-site scores, and (printed) the biomarker F-test: whether strength adds
+  anything beyond sum-TU for predicting the external proxy.
+- `figS7_site_level_tests.png` — the four panels above.
+
+The honest summary this supplement supports: a weak but directionally
+consistent NEGATIVE association between site stress and single-site network
+strength, visible with both the internal (sum-TU) and the external (UDF)
+stress measure, robust against trivial per-site scores in the Elbe (the
+largest unit), estimator-dependent in sign (BONOBO negative / LIONESS
+positive, as their biases predict), and NOT sufficient — on current data — to
+claim a monitoring biomarker (strength adds nothing beyond sum-TU for
+predicting UDF).
+
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
