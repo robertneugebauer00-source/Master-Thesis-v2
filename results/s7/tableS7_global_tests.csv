@@ -1,0 +1,8 @@
+test,statistic,p_value,method
+sign count (13/17 negative),13.0,0.0242,permutation (5000)
+median rho across units,-0.1469,0.0006,permutation (5000)
+Stouffer Z (bonobo),-2.56,0.0105,normal theory
+Stouffer Z (bonobo),-2.56,0.0048,permutation (5000)
+Stouffer Z (lioness),3.76,0.0002,normal theory
+FE OLS slope log(1+sum-TU) (bonobo),0.1093,0.0582,"basin FE, cluster SE"
+Huber robust FE slope (bonobo),-0.005,0.8834,"basin FE, robust"

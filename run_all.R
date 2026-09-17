@@ -16,17 +16,23 @@
 ## ---- 1. what to run --------------------------------------------------------
 ## Set a step to FALSE to skip it. The first three are the shared foundation and
 ## every analysis step needs them, so leave them TRUE unless they are already
-## loaded in the session.
+## loaded in the session. `lioness` (05_lioness.R) is also side-effect-free
+## function definitions -- only S6 calls them, but sourcing costs nothing.
 STEPS <- c(
   setup     = TRUE,   # 00_setup.R      palette, packages, paths, ALL parameters
   data      = TRUE,   # 01_data.R       PANGAEA, MDL/2 floor, toxic units, units
   functions = TRUE,   # 02_functions.R  prep / fit / metrics / modules / risk / plot
+  lioness   = TRUE,   # 05_lioness.R    LIONESS/BONOBO single-sample network functions
   mainline  = TRUE,   # 03_mainline.Rmd THE PIPELINE -- Tables 1-4, Figures 1-4
   S1        = FALSE,  # method justification   (slow: prevalence sweep, netCompare)
   S2        = FALSE,  # SBM / DC-SBM           (slow: 326 lines of model fitting)
   S3        = FALSE,  # cross-basin rarefaction (slow: R refits per basin)
   S4        = FALSE,  # null-model hierarchy   (slow: N draws x 10 null families)
   S5        = FALSE,  # the SGH test itself    (stress index, Q ~ stress)
+  S6        = FALSE,  # single-sample networks (LIONESS/BONOBO per-site nets)
+  S7        = FALSE,  # site-level tests (pooled inference, UDF proxy, nulls; needs S6 output)
+  S8        = FALSE,  # backbone sensitivity (needs S6 run with LIONESS_GLASSO <- TRUE)
+  S9        = FALSE,  # paired chemical+microbial simulation, known ground truth (slow: power grid)
   utils     = FALSE   # 99_utils.R      figure refresh + HTML report builder
 )
 
@@ -46,12 +52,17 @@ FILES <- list(
   setup     = file.path(R_DIR,  "00_setup.R"),
   data      = file.path(R_DIR,  "01_data.R"),
   functions = file.path(R_DIR,  "02_functions.R"),
+  lioness   = file.path(R_DIR,  "05_lioness.R"),
   mainline  = file.path(AN_DIR, "03_mainline.Rmd"),
   S1        = file.path(AN_DIR, "S1_method_justification.Rmd"),
   S2        = file.path(AN_DIR, "S2_alternative_communities.Rmd"),
   S3        = file.path(AN_DIR, "S3_crossbasin.Rmd"),
   S4        = file.path(AN_DIR, "S4_null_hierarchy.Rmd"),
   S5        = file.path(AN_DIR, "S5_stress_gradient.Rmd"),
+  S6        = file.path(AN_DIR, "S6_single_networks.Rmd"),
+  S7        = file.path(AN_DIR, "S7_site_level_tests.Rmd"),
+  S8        = file.path(AN_DIR, "S8_backbone_sensitivity.Rmd"),
+  S9        = file.path(AN_DIR, "S9_simulation.Rmd"),
   utils     = file.path(R_DIR,  "99_utils.R")
 )
 

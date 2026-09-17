@@ -1,0 +1,2640 @@
+From 3b308661c1c6f2e03e30aae1dca2982471bac905 Mon Sep 17 00:00:00 2001
+From: Robert Neugebauer <robert.neugebauer@example.com>
+Date: Wed, 16 Sep 2026 02:21:07 +0800
+Subject: [PATCH 1/7] Add LIONESS/BONOBO single-sample (per-site) network
+ module (S6)
+
+- R/05_lioness.R: closed-form leave-one-out Pearson correlation,
+  lioness_cor() (Kuijjer et al. 2019), lioness_glasso() at the fixed
+  aggregate StARS lambda with skeleton restriction, bonobo_cor()
+  replicating netZooPy::compute_bonobo exactly (Saha, Fanfani et al.
+  2024, doi:10.1101/gr.279117.124), igraph-free single_site_summary(),
+  and single_<method>_<kind>_<safe>.rds caching helpers mirroring the
+  fitted_* conventions. No side effects at source time.
+- analysis/S6_single_networks.Rmd: per-unit single-sample networks for
+  conc + tu over groups/basins/sections, per-site summary CSVs,
+  master_single_networks.csv, and a two-panel per-unit figure
+  (on-skeleton weight spread; skeleton strength vs site sum-TU).
+- run_all.R: new STEPS entries lioness (05_lioness.R) and S6 (default
+  FALSE, like the other supplements) + FILES entries.
+- tests/lioness_test.R: LOO closed form vs cor(X[-q,]) at 1e-10,
+  LIONESS/jackknife consistency, BONOBO PSD/range/shrinkage checks,
+  cross-check against the Python reference implementation at 1e-6,
+  lioness_glasso skeleton restriction, cache round-trip.
+---
+ R/05_lioness.R                  | 430 ++++++++++++++++++++++++++++++++
+ analysis/S6_single_networks.Rmd | 304 ++++++++++++++++++++++
+ run_all.R                       |   7 +-
+ tests/lioness_test.R            | 329 ++++++++++++++++++++++++
+ 4 files changed, 1069 insertions(+), 1 deletion(-)
+ create mode 100644 R/05_lioness.R
+ create mode 100644 analysis/S6_single_networks.Rmd
+ create mode 100644 tests/lioness_test.R
+
+diff --git a/R/05_lioness.R b/R/05_lioness.R
+new file mode 100644
+index 0000000..2f7465a
+--- /dev/null
++++ b/R/05_lioness.R
+@@ -0,0 +1,430 @@
++## =============================================================================
++## 05_lioness.R -- LIONESS / BONOBO single-sample (per-site) networks
++## Robert Neugebauer, MSc thesis -- LIONESS/BONOBO addition 16.09.2026
++## Created 16.09.2026 for the S6 supplement (analysis/S6_single_networks.Rmd);
++## not split out of the monolithic script -- new code, repo conventions kept.
++##
++## WHAT THIS FILE IS. The mainline network for a spatial unit is ONE graph
++## estimated from ALL of the unit's sites (02_functions.R, fit_glasso()).
++## Single-sample network methods instead ask: what does the network look like
++## from the perspective of ONE site? Two estimators are implemented:
++##
++##   LIONESS  (Kuijjer et al. 2019, iScience 14:226): linear extrapolation of
++##     the leave-one-out (LOO) estimates, e_q = N*G_all - (N-1)*G_-q, applied
++##     here to Pearson correlations (lioness_cor) and to glasso partial
++##     correlations at the FIXED aggregate StARS lambda (lioness_glasso).
++##   BONOBO   (Saha, Fanfani et al. 2024, Genome Research 35,
++##     doi:10.1101/gr.279117.124): Bayesian sample-specific covariance,
++##     Sigma_q = delta_q * dx_q dx_q' + (1 - delta_q) * S_-q, replicating the
++##     reference implementation netZooPy::compute_bonobo EXACTLY (cross-checked
++##     against the Python source, tests/lioness_test.R test 4).
++##
++## SIDE EFFECTS AT SOURCE TIME: none -- function definitions only. Everything
++## that touches repo globals (kind_dir, outroot) is evaluated lazily at call
++## time with exists() fallbacks, so this file is sourceable standalone (the
++## test suite does exactly that).
++## =============================================================================
++
++
++## =============================================================================
++## [S6] ---- closed-form leave-one-out Pearson correlation ----------------------
++##
++## Brute force would recompute cor(X[-q, ]) for every left-out site q -- an
++## O(n^2 p^2) loop of cor() calls. The sufficient statistics of the Pearson
++## correlation (column sums, column sums of squares, crossproducts) are
++## ADDITIVE over rows, so the LOO statistics are one rank-1 downdate away from
++## the full-data ones: O(p^2) per site, O(n p^2) overall.
++## =============================================================================
++
++## .loo_cor_one(X, q, S1, S2, Sxy)
++##   X   : n sites x p compounds numeric matrix (already log-transformed,
++##         MDL/2-floored -- i.e. exactly prep_unit()$Xlog)
++##   q   : index of the left-out row (site)
++##   S1  : colSums(X), S2 : colSums(X^2), Sxy : crossprod(X)  -- precomputed
++##         once by the caller so n LOO rounds cost O(n p^2), not O(n^2 p^2)
++##   returns the p x p Pearson correlation matrix of X[-q, ], symmetrised,
++##   diagonal 1. Pairs involving a zero-variance column (after the LOO removal)
++##   are set to 0 -- cor() would return NA there; 0 keeps the downstream
++##   LIONESS extrapolation finite and is the conservative choice (no edge).
++.loo_cor_one <- function(X, q, S1, S2, Sxy) {
++  n1  <- nrow(X) - 1
++  x   <- X[q, ]
++  s1  <- S1 - x                    ## column sums without site q
++  s2  <- S2 - x^2                  ## column sums of squares without site q
++  sxy <- Sxy - tcrossprod(x)       ## crossproducts without site q
++
++  num <- sxy - tcrossprod(s1) / n1             ## centred crossproducts
++  den <- s2 - s1^2 / n1                        ## centred sums of squares
++  bad <- !is.finite(den) | den <= 0            ## zero-variance guard
++  den[bad] <- NA_real_
++  r <- num / sqrt(outer(den, den))
++  r[is.na(r)] <- 0
++  r <- (r + t(r)) / 2                          ## kill fp asymmetry
++  diag(r) <- 1
++  r
++}
++
++
++## =============================================================================
++## [S6] ---- LIONESS on Pearson correlations ------------------------------------
++##
++## Kuijjer et al. (2019, iScience 14:226): if G_all is a network estimated from
++## all N samples and G_-q the same estimate with sample q removed, and the
++## estimator is (approximately) LINEAR in the samples, then the contribution of
++## sample q is recovered by extrapolation:
++##
++##     e_q = N * G_all - (N - 1) * G_-q
++##
++## The mean of the e_q over q is exactly G_all (consistency property -- checked
++## numerically in tests/lioness_test.R, test 2).
++##
++## @CAVEAT  LIONESS single-sample networks are NOT correlation matrices: the
++## extrapolation amplifies the LOO difference by ~N, so entries leave [-1, 1]
++## and the matrices are not PSD. That is a property of the method, not a bug --
++## it is precisely what BONOBO (below) was designed to fix. Do not feed
++## lioness nets to anything that assumes a valid correlation matrix (e.g.
++## eigen-decomposition-based centralities) without thinking; on-skeleton
++## summaries (single_site_summary) are safe. `clip = TRUE` truncates entries
++## to [-1, 1] for display purposes only -- off by default, because clipping
++## destroys the consistency property.
++## =============================================================================
++
++## lioness_cor(X, keep, progress, clip)
++##   X    : n sites x p compounds matrix (prep_unit()$Xlog)
++##   keep : "array" -> nets is a p x p x n array (3rd dim = sites);
++##          "list"  -> nets is a named list of n p x p matrices
++##   clip : truncate per-site entries to [-1, 1] (display only, see @CAVEAT)
++##   returns list(nets, aggregate = cor(X), method = "lioness_pearson")
++lioness_cor <- function(X, keep = c("array", "list"), progress = TRUE, clip = FALSE) {
++  keep <- match.arg(keep)
++  X <- as.matrix(X)
++  n <- nrow(X); p <- ncol(X)
++  if (n < 4) stop("lioness_cor: need at least 4 sites for a leave-one-out correlation")
++  if (is.null(rownames(X))) rownames(X) <- paste0("site_", seq_len(n))
++  if (is.null(colnames(X))) colnames(X) <- paste0("V", seq_len(p))
++
++  G_all <- stats::cor(X)
++  S1 <- colSums(X); S2 <- colSums(X^2); Sxy <- crossprod(X)
++
++  nets <- array(NA_real_, dim = c(p, p, n),
++                dimnames = list(colnames(X), colnames(X), rownames(X)))
++  for (q in seq_len(n)) {
++    G_loo <- .loo_cor_one(X, q, S1, S2, Sxy)
++    e_q   <- n * G_all - (n - 1) * G_loo
++    if (clip) e_q <- pmax(pmin(e_q, 1), -1)
++    nets[, , q] <- e_q
++    if (progress && (q %% max(1, n %/% 10) == 0 || q == n))
++      message(sprintf("[S6] lioness_cor: site %d/%d", q, n))
++  }
++
++  if (keep == "list")
++    nets <- setNames(lapply(seq_len(n), function(q) nets[, , q]), rownames(X))
++
++  list(nets = nets, aggregate = G_all, method = "lioness_pearson")
++}
++
++
++## =============================================================================
++## [S6] ---- LIONESS on glasso partial correlations -----------------------------
++##
++## The mainline network is a glasso PARTIAL-correlation network, so the
++## single-sample companion that is directly comparable to it applies the
++## LIONESS extrapolation to glasso estimates, not to marginal correlations.
++## StARS is NOT re-run per site -- that would be n full stability selections.
++## Instead every LOO refit uses the FIXED aggregate lambda (the one StARS
++## picked on all sites), so each refit is a single glasso solve: n glasso
++## fits at one lambda each, roughly the cost of one mainline fit's lambda
++## path. Fixed lambda is also the statistically sensible choice: per-site
++## networks then describe the same penalised model, differing only in which
++## site is extrapolated.
++##
++## Edge conversion is EXACTLY fit_glasso's (02_functions.R):
++##   pcor = -Omega / outer(sqrt(diag(Omega)), sqrt(diag(Omega))), diag = 0,
++##   symmetrised. The glasso solution at a fixed lambda is already sparse, so
++##   no extra refit-mask is needed (fit_glasso's mask only re-zeros what StARS
++##   deselected along the path).
++##
++## restrict_to_aggregate = TRUE zeroes every entry whose aggregate edge is
++## zero: all per-site networks then live on the SAME StARS-selected skeleton,
++## which is what makes their on-skeleton weights comparable across sites (and
++## is the analogue of the fixed global node set, one level down).
++## =============================================================================
++
++## lioness_glasso(X, lambda, A_agg, restrict_to_aggregate, seed, progress)
++##   X      : n sites x p compounds matrix (prep_unit()$Xlog)
++##   lambda : FIXED penalty, normally fit_glasso()$lambda / the cached
++##            fitted_<kind>_<safe>.rds $lambda_glasso
++##   A_agg  : aggregate p x p partial-correlation adjacency; NULL -> fitted
++##            here on all sites at the same fixed lambda
++##   returns list(nets = p x p x n array, aggregate = A_agg, lambda,
++##                restricted, method = "lioness_glasso")
++lioness_glasso <- function(X, lambda, A_agg = NULL, restrict_to_aggregate = TRUE,
++                           seed = 42, progress = TRUE) {
++  if (!requireNamespace("huge", quietly = TRUE))
++    stop("lioness_glasso: package 'huge' is required (glasso refits); ",
++         "install it or use lioness_cor()/bonobo_cor() instead")
++  X <- as.matrix(X)
++  n <- nrow(X); p <- ncol(X)
++  if (n < 5) stop("lioness_glasso: need at least 5 sites for leave-one-out glasso")
++  if (is.null(rownames(X))) rownames(X) <- paste0("site_", seq_len(n))
++  if (is.null(colnames(X))) colnames(X) <- paste0("V", seq_len(p))
++
++  ## [vRN-fix pattern 12.08.2026] glasso at a fixed lambda is deterministic,
++  ## but keep the seed argument for parity with fit_glasso() and the same
++  ## no-RNG-leak guard, so loops over units stay reproducible regardless.
++  if (!exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) stats::runif(1)
++  .old_seed <- get(".Random.seed", envir = .GlobalEnv)
++  on.exit(assign(".Random.seed", .old_seed, envir = .GlobalEnv), add = TRUE)
++  set.seed(seed)
++
++  ## one glasso solve at the fixed lambda -> partial correlations, fit_glasso-style
++  .pcor_at_lambda <- function(M) {
++    h     <- huge::huge(as.matrix(M), method = "glasso", lambda = lambda,
++                        cov.output = TRUE, verbose = FALSE)
++    Omega <- as.matrix(h$icov[[1]])          # single lambda -> single precision matrix
++    d     <- sqrt(diag(Omega))
++    pcor  <- -Omega / outer(d, d)
++    diag(pcor) <- 0
++    (pcor + t(pcor)) / 2
++  }
++
++  if (is.null(A_agg)) A_agg <- .pcor_at_lambda(X)
++  dimnames(A_agg) <- list(colnames(X), colnames(X))
++
++  nets <- array(NA_real_, dim = c(p, p, n),
++                dimnames = list(colnames(X), colnames(X), rownames(X)))
++  for (q in seq_len(n)) {
++    A_loo <- .pcor_at_lambda(X[-q, , drop = FALSE])
++    e_q   <- n * A_agg - (n - 1) * A_loo
++    if (restrict_to_aggregate) e_q[A_agg == 0] <- 0   ## @KEY common skeleton
++    diag(e_q) <- 0
++    nets[, , q] <- e_q
++    if (progress && (q %% max(1, n %/% 10) == 0 || q == n))
++      message(sprintf("[S6] lioness_glasso: site %d/%d", q, n))
++  }
++
++  list(nets = nets, aggregate = A_agg, lambda = lambda,
++       restricted = restrict_to_aggregate, method = "lioness_glasso")
++}
++
++
++## =============================================================================
++## [S6] ---- BONOBO: Bayesian single-sample correlation networks -----------------
++##
++## Saha, Fanfani et al. (2024, Genome Research, doi:10.1101/gr.279117.124).
++## BONOBO models each sample's covariance as a Bayesian posterior mean between
++## the leave-one-out covariance S_-q (the prior, everything the other sites
++## say) and the sample's own outer-product deviation dx_q dx_q' (the
++## likelihood, what only this site says):
++##
++##     Sigma_q = delta_q * dx_q dx_q' + (1 - delta_q) * S_-q
++##
++## with the posterior weight tuned from the data,
++##
++##     delta_q = 1 / (3 + 2 * mean(sqrt(diag(S_-q))) / var(diag(S_-q)))
++##
++## [S6] PROVENANCE NOTE: this is the netZooPy-CALIBRATED form of delta
++## (netZooPy::compute_bonobo, bonobo.py, including numpy's population variance,
++## ddof = 0, in the denominator). The paper's eq. 8 differs slightly; the
++## reference implementation is replicated here as the default so results are
++## comparable to published netZooPy output -- tests/lioness_test.R test 4
++## cross-checks against the Python original to 1e-6.
++##
++## Unlike LIONESS nets, BONOBO networks are proper correlation matrices:
++## Sigma_q is a convex combination of two PSD matrices, hence PSD, so after
++## scaling, every per-site network is PSD with entries in [-1, 1] and diagonal
++## 1. That is the property that makes BONOBO the safer choice for any
++## downstream score that assumes a valid correlation matrix.
++##
++## Sparsification (optional, also exactly netZooPy): the approximate sampling
++## variance of the Sigma_q entries under the posterior is
++##     sd_jk = sqrt(a1 * Sigma_q^2 + a2 * outer(diag(Sigma_q), diag(Sigma_q)))
++##     d = g + 1/delta_q,  a1 = (d-g+1)/((d-g)(d-g-3)),  a2 = (d-g-1)/((d-g)(d-g-3))
++## giving z = Sigma_q / sd_jk, two-sided normal p-values, and a sparse network
++## keeping only entries with |z| > qnorm(1 - alpha/2) (diagonal kept at 1).
++## =============================================================================
++
++## bonobo_cor(X, delta, alpha, progress, save_pvals, compute_sparse)
++##   X             : n sites x p compounds matrix (prep_unit()$Xlog)
++##   delta         : NULL -> tuned per site (netZooPy form, see above); or a
++##                   single numeric in (0, 1) used for every site
++##   alpha         : two-sided confidence level for the sparse mask
++##   save_pvals    : also return the p x p x n array of z-test p-values
++##                   (memory: one more full array -- off by default)
++##   compute_sparse: also return the masked sparse per-site networks
++##   returns list(nets = p x p x n dense correlations, deltas = named numeric,
++##                pvals = array or NULL, sparse = array or NULL, alpha,
++##                method = "bonobo")
++bonobo_cor <- function(X, delta = NULL, alpha = 0.05, progress = TRUE,
++                       save_pvals = FALSE, compute_sparse = TRUE) {
++  X <- as.matrix(X)
++  n <- nrow(X); p <- ncol(X)
++  if (n < 4) stop("bonobo_cor: need at least 4 sites for a leave-one-out covariance")
++  if (is.null(rownames(X))) rownames(X) <- paste0("site_", seq_len(n))
++  if (is.null(colnames(X))) colnames(X) <- paste0("V", seq_len(p))
++  if (!is.null(delta) && (length(delta) != 1 || !is.finite(delta) || delta <= 0 || delta >= 1))
++    stop("bonobo_cor: delta must be NULL or a single numeric in (0, 1)")
++
++  ## netZooPy works genes x samples; mirror that orientation internally
++  E    <- t(X)                          # p compounds x n sites
++  xbar <- rowMeans(E)                   # full-data mean (over ALL sites), as netZooPy
++
++  dn   <- list(colnames(X), colnames(X), rownames(X))
++  nets   <- array(NA_real_, dim = c(p, p, n), dimnames = dn)
++  pvals  <- if (save_pvals)     array(NA_real_, dim = c(p, p, n), dimnames = dn) else NULL
++  sparse <- if (compute_sparse) array(NA_real_, dim = c(p, p, n), dimnames = dn) else NULL
++  deltas <- setNames(rep(NA_real_, n), rownames(X))
++  thr    <- stats::qnorm(1 - alpha / 2)
++
++  for (q in seq_len(n)) {
++    ## [S6] orientation trap: np.cov treats ROWS as variables, R's cov() treats
++    ## COLUMNS as variables -- so this is cov() on the sites-x-compounds side,
++    ## not cov(E[, -q]). ddof = 1 in both, as np.cov's default.
++    S_q <- stats::cov(X[-q, , drop = FALSE])
++    dg  <- diag(S_q)
++
++    if (is.null(delta)) {
++      ## [S6] netZooPy form: numpy's var() is the POPULATION variance (ddof=0)
++      v_pop <- mean((dg - mean(dg))^2)
++      delta_q <- if (is.finite(v_pop) && v_pop > 0)
++        1 / (3 + 2 * mean(sqrt(dg)) / v_pop) else 1 / 3   ## flat fallback, documented
++    } else delta_q <- delta
++    deltas[q] <- delta_q
++
++    dx      <- E[, q] - xbar
++    Sigma_q <- delta_q * tcrossprod(dx) + (1 - delta_q) * S_q
++
++    ## covariance -> correlation; zero diagonal replaced by 1 (netZooPy guard)
++    sd_q <- sqrt(diag(Sigma_q))
++    sd_q[sd_q == 0 | !is.finite(sd_q)] <- 1
++    R_q  <- Sigma_q / outer(sd_q, sd_q)
++    R_q  <- (R_q + t(R_q)) / 2
++    nets[, , q] <- R_q
++
++    if (compute_sparse || save_pvals) {
++      g  <- p
++      d  <- g + 1 / delta_q
++      a1 <- (d - g + 1) / ((d - g) * (d - g - 3))
++      a2 <- (d - g - 1) / ((d - g) * (d - g - 3))
++      sd_jk <- sqrt(a1 * Sigma_q^2 + a2 * tcrossprod(diag(Sigma_q)))
++      z     <- Sigma_q / sd_jk
++      pv    <- 2 * (1 - stats::pnorm(abs(z)))
++      if (save_pvals) pvals[, , q] <- pv
++      if (compute_sparse) {
++        mask <- abs(z) > thr
++        mask[is.na(mask)] <- FALSE        ## numpy: nan > x is False
++        sp  <- R_q * mask
++        diag(sp) <- 1                     ## netZooPy: eye + (1-eye) * masked dense
++        sparse[, , q] <- sp
++      }
++    }
++    if (progress && (q %% max(1, n %/% 10) == 0 || q == n))
++      message(sprintf("[S6] bonobo_cor: site %d/%d", q, n))
++  }
++
++  list(nets = nets, deltas = deltas, pvals = pvals, sparse = sparse,
++       alpha = alpha, method = "bonobo")
++}
++
++
++## =============================================================================
++## [S6] ---- per-site summary scores --------------------------------------------
++##
++## igraph-free on purpose: the per-site objects are what feeds downstream
++## regressions (site-level network score ~ site-level stress, the SGH readout
++## in S6), and that needs a tidy data.frame, not a graph object.
++## =============================================================================
++
++## single_site_summary(nets, A_agg, membership)
++##   nets       : p x p x n array (or named list of n p x p matrices), as
++##                returned in $nets by lioness_cor / lioness_glasso / bonobo_cor
++##   A_agg      : optional aggregate adjacency; the SKELETON is A_agg != 0
++##   membership : optional named module vector (e.g. fit$mods_glasso)
++##   returns a data.frame, one row per site (row names = site ids):
++##     mean_weight / sd_weight      over ALL off-diagonal entries
++##     n_edges_on_skeleton          skeleton edges with non-zero weight at this
++##                                  site (= skeleton size for dense nets)
++##     mean_weight_on_skeleton      mean per-site weight over skeleton edges
++##     strength_skeleton            sum of |weight| over skeleton edges
++##     within_module_mean           mean weight over skeleton edges whose both
++##                                  endpoints share a module (needs membership)
++single_site_summary <- function(nets, A_agg = NULL, membership = NULL) {
++  if (is.list(nets) && !is.array(nets)) {
++    nn <- names(nets); if (is.null(nn)) nn <- paste0("site_", seq_along(nets))
++    p  <- ncol(nets[[1]])
++    nets <- array(unlist(nets, use.names = FALSE), dim = c(p, p, length(nets)),
++                  dimnames = list(colnames(nets[[1]]), colnames(nets[[1]]), nn))
++  }
++  p <- dim(nets)[1]; n <- dim(nets)[3]
++  sites <- dimnames(nets)[[3]]; if (is.null(sites)) sites <- paste0("site_", seq_len(n))
++  comps <- dimnames(nets)[[1]]; if (is.null(comps)) comps <- paste0("V", seq_len(p))
++
++  ut   <- upper.tri(nets[, , 1])
++  skel <- if (!is.null(A_agg)) (A_agg != 0) & ut else ut
++  n_skel <- sum(skel)
++
++  within <- NULL
++  if (!is.null(membership)) {
++    mm <- membership[comps]
++    if (any(is.na(mm))) {
++      ## compounds without a module assignment each form their own singleton,
++      ## so they can never contribute a within-module edge
++      mm[is.na(mm)] <- max(mm, na.rm = TRUE) + seq_len(sum(is.na(mm)))
++    }
++    within <- outer(mm, mm, `==`) & skel
++  }
++
++  rows <- lapply(seq_len(n), function(q) {
++    W  <- nets[, , q]
++    w  <- W[ut]
++    ws <- W[skel]
++    data.frame(
++      site                   = sites[q],
++      mean_weight            = mean(w),
++      sd_weight              = stats::sd(w),
++      n_edges_on_skeleton    = if (!is.null(A_agg)) sum(ws != 0) else NA_integer_,
++      mean_weight_on_skeleton = if (!is.null(A_agg) && n_skel > 0) mean(ws) else NA_real_,
++      strength_skeleton      = if (!is.null(A_agg) && n_skel > 0) sum(abs(ws)) else NA_real_,
++      within_module_mean     = if (!is.null(within) && sum(within) > 0) mean(W[within]) else NA_real_,
++      stringsAsFactors = FALSE)
++  })
++  out <- do.call(rbind, rows)
++  rownames(out) <- out$site
++  out
++}
++
++
++## =============================================================================
++## [S6] ---- caching helpers (fitted_<kind>_<safe>.rds conventions) -------------
++##
++## Mirrors fitted_path()/load_fitted()/save_fitted() in 02_functions.R, one
++## .rds per unit per data kind per single-sample METHOD. kind_dir() and
++## outroot are looked up LAZILY (call time) with exists() fallbacks, so this
++## file stays sourceable without 00-02 loaded (tests do exactly that).
++## =============================================================================
++
++## single_net_path(kind, safe, method, root) -> path to single_<method>_<kind>_<safe>.rds
++single_net_path <- function(kind, safe, method,
++                            root = if (exists("outroot")) get("outroot") else "outputs_vRN") {
++  kd <- if (exists("kind_dir", mode = "function")) kind_dir(kind) else
++        if (kind == "conc") "concentration" else "toxic_unit"
++  file.path(root, kd, safe, sprintf("single_%s_%s_%s.rds", method, kind, safe))
++}
++
++## save_single_nets(obj, kind, safe, method, root) -- obj is the list returned
++## by lioness_cor()/lioness_glasso()/bonobo_cor(); returns the path invisibly.
++save_single_nets <- function(obj, kind, safe, method,
++                             root = if (exists("outroot")) get("outroot") else "outputs_vRN") {
++  f <- single_net_path(kind, safe, method, root)
++  dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
++  saveRDS(obj, f)
++  message(sprintf("[S6] saved %s single-sample nets: %s", method, f))
++  invisible(f)
++}
++
++## load_single_nets(kind, safe, method, root) -- cached list, or NULL if absent.
++load_single_nets <- function(kind, safe, method,
++                             root = if (exists("outroot")) get("outroot") else "outputs_vRN") {
++  f <- single_net_path(kind, safe, method, root)
++  if (file.exists(f)) readRDS(f) else NULL
++}
+diff --git a/analysis/S6_single_networks.Rmd b/analysis/S6_single_networks.Rmd
+new file mode 100644
+index 0000000..c7a6c63
+--- /dev/null
++++ b/analysis/S6_single_networks.Rmd
+@@ -0,0 +1,304 @@
++---
++title: "S6 -- Single-sample networks (LIONESS / BONOBO)"
++subtitle: "Per-site compound co-occurrence networks for every spatial unit; site-level network scores for regressions against site-level stress."
++author: "Robert Neugebauer (vRN)"
++date: "16.09.2026"
++output:
++  html_document:
++    toc: true
++    toc_float: true
++    number_sections: true
++    code_folding: show
++---
++
++```{r knitr-opts, include=FALSE}
++knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
++                      fig.width = 11, fig.height = 5)
++```
++
++```{r split-source, message=FALSE}
++## Everything below assumes the shared setup/data/functions are loaded.
++## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
++sp <- file.path("..", "R")
++source(file.path(sp, "00_setup.R"))
++source(file.path(sp, "01_data.R"))
++source(file.path(sp, "02_functions.R"))
++## [S6] the single-sample estimators live in their own file (05_lioness.R) --
++## function definitions only, no side effects on source.
++source(file.path(sp, "05_lioness.R"))
++```
++
++
++# Rationale (read me first)
++
++Every network in the mainline is **one graph per spatial unit**, estimated from
++all of the unit's sites at once. That answers "how do compounds co-occur in
++this basin?" but it cannot answer the follow-up the SGH question really needs:
++"how does the co-occurrence structure differ **from site to site**?" — because
++a single aggregate network has no per-site scores to regress against per-site
++stress. Single-sample network methods close exactly that gap: they estimate
++one network **per site**, so every site gets its own edge weights, and
++site-level summaries of those weights (mean weight on the aggregate skeleton,
++skeleton strength, within-module connectivity) become a response variable at
++the same resolution as the site's toxic-unit sum.
++
++The classical estimator is **LIONESS** (Kuijjer et al. 2019, iScience 14:226).
++If `G` is a network estimated from all `N` samples and `G_-q` the same estimate
++with sample `q` left out, then — for any estimator linear in the samples — the
++network from sample `q`'s perspective is recovered by linear extrapolation:
++**e_q = N·G − (N−1)·G_-q**. The mean of the per-site networks is exactly the
++aggregate network, so nothing is invented; the aggregate is simply decomposed
++into per-site contributions. The price is that LIONESS networks are not valid
++correlation matrices (entries leave [−1, 1], no PSD guarantee) — the
++extrapolation amplifies leave-one-out noise by a factor of ~N. **BONOBO**
++(Saha, Fanfani et al. 2024, Genome Research, doi:10.1101/gr.279117.124) is the
++Bayesian alternative built to fix that: each site's covariance is a posterior
++mean between the leave-one-out covariance (prior) and the site's own deviation
++(likelihood), `Sigma_q = delta_q·dx_q·dx_q' + (1−delta_q)·S_-q`, which is a
++convex combination of PSD matrices — so every BONOBO network is a proper
++correlation matrix in [−1, 1], at the cost of shrinking every site toward the
++leave-one-out bulk. We compute both, side by side, on the same log-transformed,
++MDL/2-floored matrix the mainline glasso sees, and summarise each per-site
++network **on the aggregate StARS skeleton** so the scores are comparable
++across sites (same edges, same modules — the fixed-node-set idea, one level
++down). Those per-site scores are what a site-level SGH regression
++(score ~ sum-TU) needs; the per-unit figure below shows the first look.
++
++
++## Parameters
++
++```{r s6-params}
++## [S6] LIONESS_GLASSO refits the glasso once per site at the FIXED aggregate
++## StARS lambda (no per-site StARS) -- the per-site partial-correlation
++## companion to the mainline network. Off by default: it costs n glasso solves
++## per unit. The two correlation-based methods are cheap and always run.
++LIONESS_GLASSO <- FALSE
++BONOBO_ALPHA   <- 0.05                       # two-sided level for the BONOBO sparse mask
++WHICH          <- c("lioness", "bonobo")     # subset of c("lioness","bonobo","lioness_glasso")
++
++## [S6] size guards: below 5 compounds there is no network to speak of; below
++## 8 sites the leave-one-out estimates (n-1 >= 7) are too fragile to be worth
++## a per-site decomposition. The mainline uses n_sites >= 4; S6 is stricter.
++S6_MIN_COMP  <- 5L
++S6_MIN_SITES <- 8L
++```
++
++
++## Per-unit loop
++
++```{r s6-run, results='hide'}
++## [S6] for every unit: aggregate fit from the mainline cache when present
++## (fitted_<kind>_<safe>.rds -- the skeleton and modules the per-site nets are
++## read against), refit at the current parameters otherwise. One tryCatch per
++## unit, exactly as in 03_mainline.Rmd, so one broken unit cannot sink the run.
++s6_units <- c(units, basin_units, section_units)
++
++run_s6_unit <- function(kind, u) {
++  pu <- prep_unit(kind, u$site_ids)
++  if (pu$n_comp < S6_MIN_COMP || pu$n_sites < S6_MIN_SITES) {
++    message("[S6] skipping ", kind, " ", u$safe,
++            " (n_comp = ", pu$n_comp, ", n_sites = ", pu$n_sites, " -- too small)")
++    return(NULL)
++  }
++
++  fit <- tryCatch(load_fitted(kind, u$safe), error = function(e) NULL)
++  if (is.null(fit)) {
++    message("[S6] no cached fit for ", kind, " ", u$safe,
++            " -- refitting glasso at current parameters (knit 03_mainline.Rmd for the canonical cache)")
++    gl  <- fit_glasso(pu$Xlog)
++    fit <- list(A_glasso = gl$A, lambda_glasso = gl$lambda,
++                mods_glasso = greedy_modules(gl$A),
++                n_sites = pu$n_sites, n_comp = pu$n_comp)
++  }
++
++  outdir <- file.path(outroot, kind_dir(kind), u$safe)
++  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
++
++  ## -- the single-sample estimators -----------------------------------------
++  res <- list()
++  if ("lioness" %in% WHICH)
++    res$lioness <- lioness_cor(pu$Xlog)
++  if ("bonobo" %in% WHICH)
++    res$bonobo <- bonobo_cor(pu$Xlog, alpha = BONOBO_ALPHA)
++  ## [S6] the LIONESS_GLASSO flag alone switches this on -- WHICH selects the
++  ## correlation-based methods; the glasso variant is too expensive to be
++  ## selected silently by a vector entry.
++  if (LIONESS_GLASSO)
++    res$lioness_glasso <- lioness_glasso(pu$Xlog, lambda = fit$lambda_glasso,
++                                         A_agg = fit$A_glasso,
++                                         restrict_to_aggregate = TRUE)
++
++  ## -- cache one .rds per method next to fitted_<kind>_<safe>.rds ------------
++  for (md in names(res))
++    save_single_nets(c(res[[md]], list(kind = kind, unit = u$safe,
++                                       n_sites = pu$n_sites, n_comp = pu$n_comp)),
++                     kind, u$safe, md)
++
++  ## -- per-site summary scores (on the aggregate skeleton + modules) ---------
++  summ <- do.call(rbind, lapply(names(res), function(md) {
++    s <- single_site_summary(res[[md]]$nets, A_agg = fit$A_glasso,
++                             membership = fit$mods_glasso)
++    cbind(kind = kind, unit = u$safe, label = u$label, method = md, s,
++          stringsAsFactors = FALSE)
++  }))
++  write.csv(summ, file.path(outdir, "tableS6_single_site_summary.csv"), row.names = FALSE)
++
++  list(kind = kind, unit = u$safe, label = u$label, res = res, summary = summ,
++       fit = fit, pu = pu)
++}
++
++s6_results <- list()
++for (kind in c("conc", "tu")) {
++  for (u in s6_units) {
++    r <- tryCatch(run_s6_unit(kind, u),
++                  error = function(e) { message("[S6] error on ", kind, " ", u$safe,
++                                                ": ", conditionMessage(e)); NULL })
++    if (!is.null(r)) s6_results[[paste(kind, u$safe, sep = "_")]] <- r
++  }
++}
++message(sprintf("[S6] %d unit x data-kind combinations produced single-sample networks", length(s6_results)))
++```
++
++
++## Master summary across units
++
++```{r s6-master}
++## [S6] one row per site x method x unit: the table a site-level stress
++## regression reads. Written next to the other master_*.csv files.
++s6_master <- if (length(s6_results))
++  do.call(rbind, lapply(s6_results, `[[`, "summary")) else NULL
++
++if (!is.null(s6_master)) {
++  write.csv(s6_master, file.path(outroot, "master_single_networks.csv"), row.names = FALSE)
++  message("[S6] master table: ", file.path(outroot, "master_single_networks.csv"),
++          " (", nrow(s6_master), " rows)")
++  print(head(s6_master, 12))
++} else {
++  message("[S6] no units produced results -- nothing written.")
++}
++```
++
++
++## Per-unit figures
++
++Two panels per unit. **(a)** The distribution of per-site mean edge weights on
++the aggregate skeleton, one density per method — this shows how much the
++per-site view disperses around the aggregate (LIONESS widely, BONOBO hardly —
++that is the shrinkage, not a bug). **(b)** The site's skeleton strength (sum
++of |weight| over the StARS-selected edges) against the site's total toxic
++pressure (sum-TU over compounds), with the Spearman rho in the title — the
++site-level analogue of the S5 stress-gradient test, now with one point **per
++site** instead of one per unit.
++
++```{r s6-figures, results='hide'}
++## [S6] base graphics, as everywhere in this repo.
++method_pal <- c(lioness = "#457B9D", bonobo = "#2A9D8F", lioness_glasso = "#9B2226")
++
++for (r in s6_results) {
++  outdir <- file.path(outroot, kind_dir(r$kind), r$unit)
++  methods <- names(r$res)
++
++  ## per-site total toxic units (mixture pressure), matched by site id.
++  ## [S6] match on the $site COLUMN, not on row names: rbind() across methods
++  ## deduplicates row names (EUS_001 -> EUS_0011 in the second block), so row
++  ## names silently mismatch tu_mat for every method after the first.
++  sum_tu <- NULL
++  if (exists("tu_mat") && ncol(tu_mat) > 0) {
++    sites_tu <- intersect(r$summary$site[r$summary$method == methods[1]], colnames(tu_mat))
++    if (length(sites_tu) >= 4) sum_tu <- colSums(tu_mat[, sites_tu, drop = FALSE])
++  }
++
++  png(file.path(outdir, "figS6_single_networks.png"), width = 1500, height = 1100, res = 150)
++  par(mfrow = c(1, 2), mar = c(4.8, 4.8, 4.6, 1.2), oma = c(0, 0, 2.5, 0))
++
++  ## (a) density of per-site on-skeleton mean weights, one line per method
++  ## [S6] guard the EMPTY-SKELETON case: units whose StARS network has zero
++  ## edges (the Rhine-thirds case in the mainline) have all-NA on-skeleton
++  ## scores -- plot a note instead of dying on sd(NA).
++  dens <- lapply(methods, function(md) {
++    x <- r$summary$mean_weight_on_skeleton[r$summary$method == md]
++    x <- x[is.finite(x)]
++    if (length(x) >= 3 && stats::sd(x) > 0) density(x) else NULL
++  })
++  names(dens) <- methods
++  ok <- !vapply(dens, is.null, logical(1))
++  if (any(ok)) {
++    xr <- range(unlist(lapply(dens[ok], `[[`, "x")))
++    yr <- range(unlist(lapply(dens[ok], `[[`, "y")))
++    plot(NA, xlim = xr, ylim = yr,
++         xlab = "Per-site mean weight on the aggregate skeleton",
++         ylab = "Density over sites",
++         main = "(a) spread of per-site networks")
++    for (md in methods[ok]) lines(dens[[md]], col = method_pal[md], lwd = 2.2)
++    legend("topright", bty = "n", cex = 0.9, legend = methods[ok],
++           col = method_pal[methods[ok]], lwd = 2.2)
++  } else {
++    plot.new(); title(main = "(a) spread of per-site networks")
++    text(0.5, 0.5, "not enough sites for a density", col = "grey50")
++  }
++
++  ## (b) skeleton strength vs total TU, Spearman rho in the title.
++  ## [S6] the methods live on different strength scales (LIONESS extrapolates,
++  ## BONOBO shrinks), so for DISPLAY each method's strength is z-standardised
++  ## within the unit -- the Spearman rho in the title is scale-free and
++  ## unaffected; the raw values are in tableS6_single_site_summary.csv.
++  y_all <- r$summary$strength_skeleton
++  if (!is.null(sum_tu) && any(is.finite(y_all))) {
++    rhos <- setNames(rep(NA_real_, length(methods)), methods)
++    z_of <- function(x) { s <- stats::sd(x, na.rm = TRUE)
++                          if (is.finite(s) && s > 0) as.numeric(scale(x)) else x * 0 }
++    plot(NA, xlim = range(sum_tu),
++         ylim = range(unlist(lapply(methods, function(md)
++           z_of(r$summary$strength_skeleton[r$summary$method == md]))), na.rm = TRUE),
++         xlab = "Site total toxic units (sum-TU)",
++         ylab = "Per-site skeleton strength (z-score within method)",
++         main = "(b) network strength vs site stress")
++    for (md in methods) {
++      d  <- r$summary[r$summary$method == md, ]
++      d  <- d[d$site %in% names(sum_tu), ]
++      x  <- sum_tu[d$site]
++      points(x, z_of(d$strength_skeleton), pch = 21, bg = method_pal[md], col = "grey20", cex = 1.3)
++      if (any(is.finite(d$strength_skeleton)))
++        rhos[md] <- suppressWarnings(cor(x, d$strength_skeleton, method = "spearman"))
++    }
++    legend("topleft", bty = "n", cex = 0.9, legend = methods,
++           pch = 21, pt.bg = method_pal[methods], col = "grey20")
++    mtext(sprintf("Spearman rho: %s",
++                  paste(sprintf("%s = %.2f", methods, rhos), collapse = ", ")),
++          side = 3, line = 0.3, cex = 0.8, col = "grey25")
++  } else {
++    plot.new(); title(main = "(b) network strength vs site stress")
++    text(0.5, 0.5, if (is.null(sum_tu)) "no TU data for these sites"
++                   else "empty aggregate skeleton -- no on-skeleton scores", col = "grey50")
++  }
++
++  mtext(sprintf("%s -- %s   (per-site networks on the aggregate StARS skeleton)",
++                r$label, if (r$kind == "conc") "Concentrations" else "Toxic units"),
++        outer = TRUE, cex = 1.05, font = 2)
++  dev.off()
++}
++```
++
++
++## How to read the output
++
++Per unit and data kind, one `single_<method>_<kind>_<unit>.rds` next to the
++mainline `fitted_<kind>_<unit>.rds` (the full p x p x n array of per-site
++networks; BONOBO additionally carries the tuned `deltas` and, on request,
++p-values and the sparsified networks), one `tableS6_single_site_summary.csv`
++in the unit folder, and one `figS6_single_networks.png`. Across units,
++`master_single_networks.csv` at the output root holds every site x method
++score — that is the table to join against site-level stress (sum-TU, land use,
++position along the river) for the site-resolution SGH analysis. Remember the
++method caveat when reading the distributions: LIONESS per-site weights are
++extrapolations, not correlations — their wider spread around the aggregate is
++the price of an unbiased decomposition; BONOBO's tighter spread is shrinkage
++toward the leave-one-out bulk, the price of staying a valid correlation
++matrix. Neither spread is "the truth"; the two methods bracket it.
++
++
++# Session info
++
++```{r session-info}
++sessionInfo()
++```
+diff --git a/run_all.R b/run_all.R
+index fe388d0..bec2487 100644
+--- a/run_all.R
++++ b/run_all.R
+@@ -16,17 +16,20 @@
+ ## ---- 1. what to run --------------------------------------------------------
+ ## Set a step to FALSE to skip it. The first three are the shared foundation and
+ ## every analysis step needs them, so leave them TRUE unless they are already
+-## loaded in the session.
++## loaded in the session. `lioness` (05_lioness.R) is also side-effect-free
++## function definitions -- only S6 calls them, but sourcing costs nothing.
+ STEPS <- c(
+   setup     = TRUE,   # 00_setup.R      palette, packages, paths, ALL parameters
+   data      = TRUE,   # 01_data.R       PANGAEA, MDL/2 floor, toxic units, units
+   functions = TRUE,   # 02_functions.R  prep / fit / metrics / modules / risk / plot
++  lioness   = TRUE,   # 05_lioness.R    LIONESS/BONOBO single-sample network functions
+   mainline  = TRUE,   # 03_mainline.Rmd THE PIPELINE -- Tables 1-4, Figures 1-4
+   S1        = FALSE,  # method justification   (slow: prevalence sweep, netCompare)
+   S2        = FALSE,  # SBM / DC-SBM           (slow: 326 lines of model fitting)
+   S3        = FALSE,  # cross-basin rarefaction (slow: R refits per basin)
+   S4        = FALSE,  # null-model hierarchy   (slow: N draws x 10 null families)
+   S5        = FALSE,  # the SGH test itself    (stress index, Q ~ stress)
++  S6        = FALSE,  # single-sample networks (LIONESS/BONOBO per-site nets)
+   utils     = FALSE   # 99_utils.R      figure refresh + HTML report builder
+ )
+ 
+@@ -46,12 +49,14 @@ FILES <- list(
+   setup     = file.path(R_DIR,  "00_setup.R"),
+   data      = file.path(R_DIR,  "01_data.R"),
+   functions = file.path(R_DIR,  "02_functions.R"),
++  lioness   = file.path(R_DIR,  "05_lioness.R"),
+   mainline  = file.path(AN_DIR, "03_mainline.Rmd"),
+   S1        = file.path(AN_DIR, "S1_method_justification.Rmd"),
+   S2        = file.path(AN_DIR, "S2_alternative_communities.Rmd"),
+   S3        = file.path(AN_DIR, "S3_crossbasin.Rmd"),
+   S4        = file.path(AN_DIR, "S4_null_hierarchy.Rmd"),
+   S5        = file.path(AN_DIR, "S5_stress_gradient.Rmd"),
++  S6        = file.path(AN_DIR, "S6_single_networks.Rmd"),
+   utils     = file.path(R_DIR,  "99_utils.R")
+ )
+ 
+diff --git a/tests/lioness_test.R b/tests/lioness_test.R
+new file mode 100644
+index 0000000..43ce946
+--- /dev/null
++++ b/tests/lioness_test.R
+@@ -0,0 +1,329 @@
++## =============================================================================
++## tests/lioness_test.R -- numerical validation of R/05_lioness.R
++## [S6 addition 16.09.2026]
++##
++## PURPOSE. Prove that the single-sample estimators are numerically correct:
++##   1. the closed-form leave-one-out Pearson correlation equals brute-force
++##      cor(X[-q, ]) to 1e-10 for every left-out site;
++##   2. the LIONESS decomposition is internally consistent (jackknife
++##      pseudo-value identity, exact) and reproduces cor(X) up to the known
++##      O(1/n) jackknife bias of nonlinear statistics;
++##   3. BONOBO per-site networks are proper correlation matrices (PSD, entries
++##      in [-1, 1]) and shrink toward the truth relative to LIONESS;
++##   4. bonobo_cor() replicates the Python reference implementation
++##      (netZooPy::compute_bonobo) to 1e-6 -- skipped, not failed, if python3
++##      or its deps are unavailable;
++##   5. lioness_glasso() runs and honours the aggregate-skeleton restriction
++##      (only if the huge package is available).
++##
++## RUN. From the repo root (any working directory works; the script walks up
++## from its own location until it finds run_all.R):
++##   Rscript tests/lioness_test.R
++## Exit status 0 and "LIONESS TEST PASSED" on success, exit status 1 otherwise.
++## Base R only; huge is optional; python3 + numpy + scipy optional (test 4).
++## =============================================================================
++
++## ---- locate the repo root ---------------------------------------------------
++.args     <- commandArgs(trailingOnly = FALSE)
++.file_arg <- sub("^--file=", "", grep("^--file=", .args, value = TRUE))
++.start    <- if (length(.file_arg)) dirname(normalizePath(.file_arg[1], winslash = "/")) else
++             getwd()
++ROOT <- .start
++repeat {
++  if (file.exists(file.path(ROOT, "run_all.R"))) break
++  .parent <- dirname(ROOT)
++  if (identical(.parent, ROOT)) stop("lioness_test.R: could not locate repo root (run_all.R not found above ", .start, ")")
++  ROOT <- .parent
++}
++cat("repo root:", ROOT, "\n")
++
++## ---- tiny check harness (same spirit as tests/smoke_test.R) ------------------
++.failures <- 0L
++check <- function(ok, msg) {
++  ok <- isTRUE(ok)
++  cat(sprintf("[%s] %s\n", if (ok) "PASS" else "FAIL", msg))
++  if (!ok) .failures <<- .failures + 1L
++  invisible(ok)
++}
++
++## ---- the file under test: sourceable standalone, no 00-02 globals needed -----
++source(file.path(ROOT, "R", "05_lioness.R"))
++
++## ---- synthetic data ----------------------------------------------------------
++## n = 25 sites x p = 12 compounds, plain Gaussian -- the tests are numerical
++## identities / matrix properties, so no planted structure is needed here.
++set.seed(42)
++n <- 25L; p <- 12L
++site_ids <- sprintf("EUS_%03d", seq_len(n))
++comp_ids <- sprintf("Compound_%02d", seq_len(p))
++X <- matrix(rnorm(n * p), n, p, dimnames = list(site_ids, comp_ids))
++
++## =============================================================================
++## TEST 1 -- closed-form LOO Pearson == brute force cor(X[-q, ])
++## =============================================================================
++S1 <- colSums(X); S2 <- colSums(X^2); Sxy <- crossprod(X)
++loo_err <- max(sapply(seq_len(n), function(q)
++  max(abs(.loo_cor_one(X, q, S1, S2, Sxy) - cor(X[-q, ])))))
++check(loo_err < 1e-10,
++      sprintf("closed-form LOO correlation == cor(X[-q, ]) for all %d sites (max err %.2e)", n, loo_err))
++
++## zero-variance guard: a constant column must yield 0s, not NaNs
++Xc <- X; Xc[, 3] <- 5
++rc <- .loo_cor_one(Xc, 1, colSums(Xc), colSums(Xc^2), crossprod(Xc))
++check(!any(is.na(rc)) && all(rc[3, -3] == 0) && all(rc[-3, 3] == 0) && diag(rc)[3] == 1,
++      "zero-variance column: off-diagonal set to 0, diagonal 1, no NaN")
++
++## =============================================================================
++## TEST 2 -- LIONESS consistency
++## =============================================================================
++## [S6] e_q = n*G - (n-1)*G_-q is exactly the JACKKNIFE PSEUDO-VALUE of the
++## correlation statistic. Its mean over q is therefore exactly the jackknife
++## estimate n*cor(X) - (n-1)*mean_q cor(X[-q, ]) -- that identity is exact and
++## is what we assert at 1e-10. The LIONESS paper's "mean of single-sample nets
++## equals the aggregate" holds exactly only for statistics LINEAR in the
++## samples (e.g. covariance); for Pearson correlation the mean differs from
++## cor(X) by the jackknife bias of the statistic, O(1/n) -- verified below to
++## be small and shrinking in n, and documented in R/05_lioness.R.
++lc <- lioness_cor(X, progress = FALSE)
++check(identical(dim(lc$nets), c(p, p, n)) && identical(dimnames(lc$nets)[[3]], site_ids),
++      "lioness_cor: nets are p x p x n with site ids on the 3rd dim")
++
++mean_net <- apply(lc$nets, c(1, 2), mean)
++jk_est   <- n * cor(X) - (n - 1) * Reduce(`+`, lapply(seq_len(n), function(q) cor(X[-q, ]))) / n
++check(max(abs(mean_net - jk_est)) < 1e-10,
++      sprintf("LIONESS mean == jackknife pseudo-value mean, exact (max err %.2e)",
++              max(abs(mean_net - jk_est))))
++
++gap <- max(abs(mean_net - cor(X)))
++check(gap < 2 / n,
++      sprintf("LIONESS mean ~= cor(X) up to jackknife bias O(1/n) (gap %.4f < %.4f)", gap, 2 / n))
++
++## the covariance-level decomposition underlying it IS exact (linear statistic)
++e_cov <- lapply(seq_len(n), function(q) n * cov(X) - (n - 1) * cov(X[-q, ]))
++cov_gap <- max(abs(Reduce(`+`, e_cov) / n - cov(X)))
++check(cov_gap < 1e-10,
++      sprintf("covariance-level LIONESS decomposition is exact (max err %.2e)", cov_gap))
++
++## keep = "list" returns the same numbers as a named list
++ll <- lioness_cor(X, keep = "list", progress = FALSE)
++check(is.list(ll$nets) && length(ll$nets) == n && identical(names(ll$nets), site_ids) &&
++        max(abs(ll$nets[[1]] - lc$nets[, , 1])) < 1e-12,
++      "lioness_cor keep = 'list': named list, same numbers as the array")
++
++## =============================================================================
++## TEST 3 -- BONOBO: valid correlation matrices + shrinkage
++## =============================================================================
++bc <- bonobo_cor(X, progress = FALSE, save_pvals = TRUE)
++check(identical(dim(bc$nets), c(p, p, n)) && length(bc$deltas) == n &&
++        all(bc$deltas > 0 & bc$deltas < 1),
++      "bonobo_cor: nets p x p x n, one tuned delta in (0, 1) per site")
++
++min_eig <- min(sapply(seq_len(n), function(q)
++  min(eigen(bc$nets[, , q], symmetric = TRUE, only.values = TRUE)$values)))
++check(min_eig >= -1e-8,
++      sprintf("BONOBO nets are PSD (min eigenvalue %.2e >= -1e-8)", min_eig))
++check(max(abs(bc$nets)) <= 1 + 1e-8 &&
++        all(vapply(seq_len(n), function(q) max(abs(diag(bc$nets[, , q]) - 1)) < 1e-12, logical(1))),
++      sprintf("BONOBO entries in [-1, 1], diagonal 1 (max |entry| %.6f)", max(abs(bc$nets))))
++
++## [S6] the mean of BONOBO nets is NOT cor(X): delta_q shrinks every site
++## toward the leave-one-out bulk, so the average is biased toward the
++## aggregate covariance structure by construction. Measured here (max abs diff
++## ~ 3e-3 at n = 25) and DOCUMENTED rather than forced -- do not "fix" the
++## estimator to pass a consistency test it is not designed to satisfy.
++b_gap <- max(abs(apply(bc$nets, c(1, 2), mean) - cor(X)))
++cat(sprintf("[INFO] mean of BONOBO nets vs cor(X): max abs diff %.4f (shrinkage bias, documented)\n", b_gap))
++
++## sparse mask: diagonal 1, off-diagonal either 0 or |z| > qnorm(1 - alpha/2)
++sp_ok <- all(vapply(seq_len(n), function(q) {
++  sp <- bc$sparse[, , q]
++  all(diag(sp) == 1) && all(sp[lower.tri(sp)] == 0 | abs(bc$nets[, , q][lower.tri(sp)]) > 0)
++}, logical(1)))
++check(sp_ok && max(abs(bc$sparse)) <= 1 + 1e-8,
++      "BONOBO sparse nets: diagonal 1, masked entries zeroed, still in [-1, 1]")
++
++## shrinkage: on homogeneous one-factor data the true correlation is known;
++## BONOBO nets must sit closer to it (Frobenius) than LIONESS nets, on average
++## over seeds. [S6] this is the PSD/shrinkage property doing its job: LIONESS
++## amplifies leave-one-out noise by ~n, BONOBO averages it with the prior.
++fro <- vapply(1:6, function(sd) {
++  set.seed(100 + sd)
++  nn <- 30L; pp <- 15L; th <- rnorm(nn)
++  Xs <- vapply(seq_len(pp), function(j) 0.7 * th + rnorm(nn, sd = sqrt(1 - 0.49)), numeric(nn))
++  Rtrue <- matrix(0.49, pp, pp); diag(Rtrue) <- 1
++  Ll <- lioness_cor(Xs, progress = FALSE)$nets
++  Bb <- bonobo_cor(Xs, progress = FALSE)$nets
++  c(lioness = mean(vapply(seq_len(nn), function(q) sqrt(mean((Ll[, , q] - Rtrue)^2)), numeric(1))),
++    bonobo  = mean(vapply(seq_len(nn), function(q) sqrt(mean((Bb[, , q] - Rtrue)^2)), numeric(1))))
++}, numeric(2))
++check(mean(fro["bonobo", ]) < mean(fro["lioness", ]),
++      sprintf("BONOBO closer to the true correlation than LIONESS (mean Frobenius %.3f < %.3f, 6 seeds)",
++              mean(fro["bonobo", ]), mean(fro["lioness", ])))
++
++## =============================================================================
++## TEST 4 -- cross-check against the Python reference (netZooPy compute_bonobo)
++## =============================================================================
++## Skipped (not failed) when python3 / numpy / scipy are unavailable. The
++## helper script first tries the real netZooPy import; if the import chain
++## fails (it pulls in pandas/igraph via the panda module), it falls back to an
++## EXACT inline copy of compute_bonobo() from netZooPy/bonobo/bonobo.py, which
++## needs only numpy and scipy.stats.
++py <- Sys.which("python3")
++py_ok <- nzchar(py) && {
++  dep <- suppressWarnings(system2(py, c("-c", shQuote("import numpy, scipy.stats")),
++                                  stdout = FALSE, stderr = FALSE))
++  identical(dep, 0L)
++}
++if (!py_ok) {
++  cat("[SKIP] python3 with numpy+scipy not available -- test 4 (Python cross-check) skipped\n")
++} else {
++  td <- tempfile("bonobo_xcheck_"); dir.create(td)
++  write.csv(X, file.path(td, "X.csv"), row.names = FALSE)
++
++  py_script <- file.path(td, "ref_bonobo.py")
++  writeLines(c(
++    "import sys, numpy as np, pandas as pd",
++    "sys.path.insert(0, '/tmp/netzoo')",
++    "try:",
++    "    from netZooPy.bonobo.bonobo import compute_bonobo",
++    "    SRC = 'netZooPy import'",
++    "except Exception:",
++    "    import scipy.stats as stats",
++    "    # EXACT inline copy of netZooPy/bonobo/bonobo.py :: compute_bonobo",
++    "    # (import chain unavailable; body needs only numpy + scipy.stats)",
++    "    def compute_bonobo(expression_matrix, expression_mean, sample_idx,",
++    "                       delta=None, compute_sparse=False, confidence=0.05, save_pvals=False, **kw):",
++    "        pval = None",
++    "        mask_include = [True] * expression_matrix.shape[1]",
++    "        mask_include[sample_idx] = False",
++    "        covariance_matrix = np.cov(expression_matrix[:, mask_include])",
++    "        if delta is None:",
++    "            delta = 1 / (3 + 2 * np.sqrt(covariance_matrix.diagonal()).mean()",
++    "                         / covariance_matrix.diagonal().var())",
++    "        sscov = (delta * np.outer((expression_matrix - expression_mean)[:, sample_idx],",
++    "                                  (expression_matrix - expression_mean)[:, sample_idx])",
++    "                 + (1 - delta) * covariance_matrix)",
++    "        sscov = np.array(sscov)",
++    "        diag = np.sqrt(np.diag(np.diag(sscov)))",
++    "        diag = np.array(diag)",
++    "        indices = np.where(np.diag(diag) == 0)[0]",
++    "        for i in indices:",
++    "            diag[i, i] = 1",
++    "        sds = np.linalg.inv(diag)",
++    "        bonobo_matrix = sds @ sscov @ sds",
++    "        if compute_sparse:",
++    "            threshold = stats.norm.ppf(1 - (confidence / 2))",
++    "            g = sscov.shape[1]",
++    "            d = g + 1 / delta",
++    "            a1 = (d - g + 1) / ((d - g) * (d - g - 3))",
++    "            a2 = (d - g - 1) / ((d - g) * (d - g - 3))",
++    "            v = np.diag(sscov)",
++    "            v = (a1 * (np.multiply(sscov, sscov))) + (a2 * (np.outer(v, v)))",
++    "            v = np.sqrt(v)",
++    "            v = np.divide(sscov, v)",
++    "            pval = 2 * (1 - stats.norm.cdf(np.abs(v)))",
++    "            if not save_pvals:",
++    "                bonobo_matrix = np.eye(g) + np.multiply(",
++    "                    1 - np.eye(g), (bonobo_matrix * (np.abs(v) > threshold)))",
++    "        return (bonobo_matrix, delta, pval)",
++    "    SRC = 'inline copy of compute_bonobo'",
++    "",
++    "X = pd.read_csv(sys.argv[1]).values          # n samples x p genes",
++    "E = X.T                                      # netZooPy: genes x samples",
++    "emean = np.mean(E, axis=1, keepdims=True)",
++    "n = E.shape[1]; g = E.shape[0]",
++    "nets = np.empty((g, g, n)); sparse = np.empty((g, g, n))",
++    "pvals = np.empty((g, g, n)); deltas = np.empty(n)",
++    "for q in range(n):",
++    "    m, d, pv = compute_bonobo(E, emean, q, compute_sparse=True,",
++    "                              confidence=0.05, save_pvals=True)",
++    "    nets[:, :, q] = m; deltas[q] = d; pvals[:, :, q] = pv",
++    "    ms, _, _ = compute_bonobo(E, emean, q, compute_sparse=True,",
++    "                              confidence=0.05, save_pvals=False)",
++    "    sparse[:, :, q] = ms",
++    "np.savez(sys.argv[2], nets=nets, sparse=sparse, pvals=pvals, deltas=deltas)",
++    "print('reference source:', SRC)"
++  ), py_script)
++
++  npz  <- file.path(td, "ref.npz")
++  pout <- system2(py, c(shQuote(py_script), shQuote(file.path(td, "X.csv")), shQuote(npz)),
++                  stdout = TRUE, stderr = TRUE)
++  if (!file.exists(npz)) {
++    cat("[SKIP] python reference run failed -- test 4 skipped\n")
++    cat(paste(pout, collapse = "\n"), "\n")
++  } else {
++    cat("[INFO] python reference:", grep("reference source:", pout, value = TRUE), "\n")
++    ## read the .npz (zip of .npy files) with base R: parse the NPY v1 header.
++    ## numpy writes C-order (last axis fastest), R fills column-major (first
++    ## axis fastest), so a numpy array of shape (d1, d2, d3) read linearly is
++    ## an R array of dim (d3, d2, d1) -- reverse the dims and aperm them back.
++    read_npy <- function(con) {
++      magic <- readBin(con, "raw", 6)
++      stopifnot(magic[1] == as.raw(0x93), rawToChar(magic[-1]) == "NUMPY")
++      ver   <- readBin(con, "integer", 2, size = 1, signed = FALSE)   # major, minor
++      hlen  <- readBin(con, "integer", 1, size = 2, endian = "little")
++      hdr   <- rawToChar(readBin(con, "raw", hlen))
++      descr <- sub(".*'descr':\\s*'([^']+)'.*", "\\1", hdr)
++      fortran <- grepl("'fortran_order':\\s*True", hdr)
++      shape <- as.integer(strsplit(sub(".*'shape':\\s*\\(([^)]*)\\).*", "\\1", hdr), ",\\s*")[[1]])
++      shape <- shape[!is.na(shape)]
++      stopifnot(descr == "<f8", !fortran)
++      vals <- readBin(con, "double", prod(shape), endian = "little")
++      if (length(shape) == 1) return(vals)
++      aperm(array(vals, dim = rev(shape)), rev(seq_along(shape)))
++    }
++    zf <- unzip(npz, exdir = td)
++    get_arr <- function(nm) { con <- file(file.path(td, nm), "rb"); on.exit(close(con)); read_npy(con) }
++    py_nets   <- get_arr("nets.npy")     # numpy [gene, gene, sample] -> R [gene, gene, sample]
++    py_sparse <- get_arr("sparse.npy")
++    py_pvals  <- get_arr("pvals.npy")
++    py_deltas <- as.numeric(get_arr("deltas.npy"))
++    r_dense <- bc$nets; r_sparse <- bc$sparse; r_pvals <- bc$pvals
++    e1 <- max(abs(py_nets - r_dense)); e2 <- max(abs(py_deltas - bc$deltas))
++    e3 <- max(abs(py_sparse - r_sparse)); e4 <- max(abs(py_pvals - r_pvals))
++    check(e1 < 1e-6, sprintf("BONOBO dense nets == Python reference (max diff %.2e)", e1))
++    check(e2 < 1e-6, sprintf("BONOBO tuned deltas == Python reference (max diff %.2e)", e2))
++    check(e3 < 1e-6, sprintf("BONOBO sparse nets == Python reference (max diff %.2e)", e3))
++    check(e4 < 1e-6, sprintf("BONOBO p-values == Python reference (max diff %.2e)", e4))
++  }
++}
++
++## =============================================================================
++## TEST 5 -- lioness_glasso (only with the huge package)
++## =============================================================================
++if (!requireNamespace("huge", quietly = TRUE)) {
++  cat("[SKIP] package 'huge' not available -- test 5 (lioness_glasso) skipped\n")
++} else {
++  set.seed(9)
++  lg <- lioness_glasso(X, lambda = 0.3, progress = FALSE)
++  check(identical(dim(lg$nets), c(p, p, n)),
++        "lioness_glasso: nets are p x p x n")
++  skel_zero <- lg$aggregate == 0
++  check(all(vapply(seq_len(n), function(q) all(lg$nets[, , q][skel_zero] == 0), logical(1))),
++        "lioness_glasso: restricted nets are zero wherever the aggregate is zero")
++  check(all(vapply(seq_len(n), function(q) all(diag(lg$nets[, , q]) == 0), logical(1))),
++        "lioness_glasso: per-site diagonals are zero (partial-correlation convention)")
++  lg_free <- lioness_glasso(X, lambda = 0.3, A_agg = lg$aggregate,
++                            restrict_to_aggregate = FALSE, progress = FALSE)
++  check(any(vapply(seq_len(n), function(q) any(lg_free$nets[, , q][skel_zero] != 0), logical(1))),
++        "lioness_glasso: restrict_to_aggregate = FALSE leaves off-skeleton entries non-zero")
++}
++
++## =============================================================================
++## TEST 6 -- caching helpers (explicit root, so no outroot global is needed)
++## =============================================================================
++td2 <- tempfile("single_cache_")
++f <- save_single_nets(lc, "conc", "Unit_X", "lioness", root = td2)
++check(is.character(f) && file.exists(f) &&
++        grepl(file.path("concentration", "Unit_X", "single_lioness_conc_Unit_X.rds"), f, fixed = TRUE),
++      "save_single_nets: writes single_<method>_<kind>_<safe>.rds under <root>/<kind_dir>/<safe>/")
++bk <- load_single_nets("conc", "Unit_X", "lioness", root = td2)
++check(identical(bk$nets, lc$nets) && is.null(load_single_nets("tu", "Unit_X", "lioness", root = td2)),
++      "load_single_nets: round-trips the object; NULL for a missing cache")
++
++## ---- verdict -------------------------------------------------------------------
++if (.failures > 0L) {
++  cat(.failures, "check(s) FAILED\n")
++  quit(status = 1)
++}
++cat("LIONESS TEST PASSED\n")
+-- 
+2.39.5
+
+
+From c0e22b73745dbcf54e38ca1ab303fb70b10d9015 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Wed, 16 Sep 2026 02:28:10 +0800
+Subject: [PATCH 2/7] Doc precision: LIONESS mean == aggregate only up to
+ O(1/n) jackknife bias for correlation
+
+---
+ R/05_lioness.R                  | 6 ++++--
+ analysis/S6_single_networks.Rmd | 7 ++++---
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/R/05_lioness.R b/R/05_lioness.R
+index 2f7465a..203b2e6 100644
+--- a/R/05_lioness.R
++++ b/R/05_lioness.R
+@@ -75,8 +75,10 @@
+ ##
+ ##     e_q = N * G_all - (N - 1) * G_-q
+ ##
+-## The mean of the e_q over q is exactly G_all (consistency property -- checked
+-## numerically in tests/lioness_test.R, test 2).
++## The mean of the e_q over q equals G_all exactly for statistics LINEAR in
++## the samples (e.g. covariance); for Pearson correlation it differs by the
++## O(1/n) jackknife bias of the statistic -- both measured and documented in
++## tests/lioness_test.R, test 2.
+ ##
+ ## @CAVEAT  LIONESS single-sample networks are NOT correlation matrices: the
+ ## extrapolation amplifies the LOO difference by ~N, so entries leave [-1, 1]
+diff --git a/analysis/S6_single_networks.Rmd b/analysis/S6_single_networks.Rmd
+index c7a6c63..a60a2f0 100644
+--- a/analysis/S6_single_networks.Rmd
++++ b/analysis/S6_single_networks.Rmd
+@@ -46,9 +46,10 @@ The classical estimator is **LIONESS** (Kuijjer et al. 2019, iScience 14:226).
+ If `G` is a network estimated from all `N` samples and `G_-q` the same estimate
+ with sample `q` left out, then — for any estimator linear in the samples — the
+ network from sample `q`'s perspective is recovered by linear extrapolation:
+-**e_q = N·G − (N−1)·G_-q**. The mean of the per-site networks is exactly the
+-aggregate network, so nothing is invented; the aggregate is simply decomposed
+-into per-site contributions. The price is that LIONESS networks are not valid
++**e_q = N·G − (N−1)·G_-q**. The mean of the per-site networks reproduces the
++aggregate network up to the O(1/n) jackknife bias of the correlation statistic
++(exactly, for covariance), so nothing is invented; the aggregate is simply
++decomposed into per-site contributions. The price is that LIONESS networks are not valid
+ correlation matrices (entries leave [−1, 1], no PSD guarantee) — the
+ extrapolation amplifies leave-one-out noise by a factor of ~N. **BONOBO**
+ (Saha, Fanfani et al. 2024, Genome Research, doi:10.1101/gr.279117.124) is the
+-- 
+2.39.5
+
+
+From 97e099c97bbe932cdf50399e46a59ce2c54471e1 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Wed, 16 Sep 2026 18:16:55 +0800
+Subject: [PATCH 3/7] Add S7: site-level tests for single-site networks
+
+Follow-up analyses to S6 (LIONESS/BONOBO single-site networks):
+
+* Pooled inference across units: sign count, median rho, Stouffer's
+  method (z_i = atanh(rho_i)*sqrt(n_i-3), Z = sum/sqrt(k)) with a
+  within-unit permutation null (default 5000 draws) and per-unit
+  empirical p-values. Also fixed-effects OLS + Huber robust fit as a
+  parametric bracket, with a note on leverage/Simpson's paradox.
+* Circularity-free external test: skeleton strength vs the Urban
+  discharge fraction (UDF) pressure proxy from the PANGAEA metadata,
+  per basin, for both estimators.
+* Trivial-score benchmark: raw vs partial Spearman controlling for
+  number of detects, mean log-concentration, stream order and UDF.
+* Biomarker test: nested F-test whether strength explains UDF beyond
+  sum-TU alone.
+* 4-panel figure (forest plot with permutation null envelope,
+  estimator comparison, UDF panel, raw-vs-partial dumbbell) and four
+  CSV tables written to outputs/s7_site_level/.
+
+Wired into run_all.R as step S7 (off by default, needs S6 output).
+---
+ analysis/S7_site_level_tests.Rmd | 357 +++++++++++++++++++++++++++++++
+ run_all.R                        |   2 +
+ 2 files changed, 359 insertions(+)
+ create mode 100644 analysis/S7_site_level_tests.Rmd
+
+diff --git a/analysis/S7_site_level_tests.Rmd b/analysis/S7_site_level_tests.Rmd
+new file mode 100644
+index 0000000..c593685
+--- /dev/null
++++ b/analysis/S7_site_level_tests.Rmd
+@@ -0,0 +1,357 @@
++---
++title: "S7 -- Site-level stress-gradient tests"
++subtitle: "Pooled inference, an external pressure proxy (UDF), trivial-score benchmarks and permutation nulls for the S6 single-site networks."
++author: "Robert Neugebauer (vRN)"
++date: "16.09.2026"
++output:
++  html_document:
++    toc: true
++    toc_float: true
++    number_sections: true
++    code_folding: show
++---
++
++```{r knitr-opts, include=FALSE}
++knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
++                      fig.width = 13, fig.height = 9)
++```
++
++```{r split-source, message=FALSE}
++## Everything below assumes the shared setup/data/functions are loaded AND that
++## S6 has run (its per-site summary tables are the input). Repo-relative.
++sp <- file.path("..", "R")
++source(file.path(sp, "00_setup.R"))
++source(file.path(sp, "01_data.R"))
++source(file.path(sp, "02_functions.R"))
++source(file.path(sp, "05_lioness.R"))
++```
++
++
++# Rationale (read me first)
++
++S6 produced one network **per site** and summarised each on the aggregate StARS
++skeleton (`strength_skeleton`). The headline readout was a per-unit Spearman ρ
++between per-site strength and per-site stress (sum-TU): 13 of 17 units negative
++for BONOBO. That leaves four questions open, and S7 answers all four:
++
++1. **Pooled inference.** "13/17 negative" is not a p-value. S7 combines the 17
++   per-unit tests (Stouffer's method on Fisher-z) and, more importantly, builds
++   a **permutation null** (sum-TU shuffled within each unit) for the sign
++   count, the median ρ and the combined Z — no distributional assumptions.
++2. **Circularity.** sum-TU is computed from the SAME concentration matrix as
++   the networks, so "strength ~ sum-TU" has a built-in coupling. The PANGAEA
++   site sheet carries an **external** pressure variable the mainline never
++   uses: the **urban discharge fraction (UDF)**, a hydrological estimate of the
++   wastewater share of a site's discharge. It is not derived from the measured
++   concentrations, so "strength ~ UDF" is a circularity-free version of the
++   same question. (Stream order is kept as a hydrological covariate.)
++3. **Trivial-score benchmark.** A site's skeleton strength could just track how
++   much was detected there at all. S7 recomputes the association as a
++   **partial Spearman** given the site's detection count and mean
++   log-concentration, and fits a joint model with both trivial scores.
++4. **Biomarker test.** For a monitoring tool, strength must explain an
++   EXTERNAL outcome beyond what sum-TU already explains. S7 tests whether
++   adding strength to `UDF ~ log(1 + sum-TU)` improves the fit (F-test).
++
++Two modelling notes. First, sum-TU is extremely right-skewed and a handful of
++sites (e.g. Elbe EUS_029, sum-TU = 276) have enormous OLS leverage — pooled
++fixed-effects slopes can flip sign against the rank correlation because of
++them. S7 therefore reports both the basin-fixed-effects OLS (with
++cluster-robust SEs) and a Huber-robust fit, and treats the rank-based and
++permutation tests as primary. Second, per-site strengths are only comparable
++WITHIN a unit (each unit has its own skeleton), so all pooled models
++z-standardise strength within basin and include basin fixed effects.
++
++
++## Parameters
++
++```{r s7-params}
++S7_NPERM   <- 5000L   # permutation draws for the null distributions
++S7_MIN_UDF <- 10L     # minimum sites with UDF for a per-basin UDF test
++S7_SEED    <- 42L
++```
++
++
++## Per-site analysis table
++
++```{r s7-table}
++## [S7] start from the S6 master table when present; otherwise rebuild the
++## per-site summaries from the cached single-site nets + aggregate skeletons.
++master_file <- file.path(outroot, "master_single_networks.csv")
++if (file.exists(master_file)) {
++  s6_master <- read.csv(master_file, stringsAsFactors = FALSE)
++} else {
++  s6_units <- c(units, basin_units, section_units)
++  s6_master <- do.call(rbind, lapply(s6_units, function(u) {
++    fit <- load_fitted("conc", u$safe)
++    bo  <- load_single_nets("conc", u$safe, "bonobo")
++    li  <- load_single_nets("conc", u$safe, "lioness")
++    if (is.null(fit) || is.null(bo) || is.null(li)) return(NULL)
++    pu  <- prep_unit("conc", u$site_ids)
++    per_u <- do.call(rbind, list(
++      cbind(method = "bonobo",  single_site_summary(bo$nets, fit$A_glasso, fit$mods_glasso)),
++      cbind(method = "lioness", single_site_summary(li$nets, fit$A_glasso, fit$mods_glasso))))
++    per_u$kind <- "conc"; per_u$unit <- u$safe; per_u$label <- u$label
++    per_u
++  }))
++}
++
++bon <- subset(s6_master, method == "bonobo")
++lio <- subset(s6_master, method == "lioness",
++              select = c(unit, site, strength_skeleton))
++names(lio)[3] <- "strength_lioness"
++s7 <- merge(bon, lio, by = c("unit", "site"), all.x = TRUE)
++
++## site stress + external covariates
++sum_tu <- if (ncol(tu_mat) > 0) colSums(tu_mat) else setNames(rep(NA_real_, ncol(conc_mat)), colnames(conc_mat))
++s7$sum_tu <- sum_tu[s7$site]
++
++## [S7] UDF and stream order sit in sites_meta under their original xlsx names
++## (01_data.R renames only the five columns the mainline needs).
++udf_col <- "Urban discharge fraction (UDF)"
++so_col  <- "Stream order by Strahler"
++meta <- as.data.frame(sites_meta)
++s7$UDF          <- as.numeric(meta[match(s7$site, meta$site_id), udf_col])
++s7$stream_order <- as.numeric(meta[match(s7$site, meta$site_id), so_col])
++s7$basin        <- meta[match(s7$site, meta$site_id), "river_basin"]
++
++## trivial per-site scores over the SAME global node pool the networks use:
++## detection count and mean log10(MDL/2-floored) concentration.
++pool <- KEEP_GLOBAL$conc
++sub_pool <- conc_mat[pool, , drop = FALSE]
++fl <- sub_pool
++is_zero <- fl == 0
++fl[is_zero] <- matrix(mdl_half_ngL[pool], nrow = length(pool), ncol = ncol(fl))[is_zero]
++logf <- log10(fl)
++s7$n_det    <- colSums(sub_pool > 0)[s7$site]
++s7$mean_log <- colMeans(logf)[s7$site]
++
++write.csv(s7, file.path(outroot, "tableS7_site_table.csv"), row.names = FALSE)
++message("[S7] site table: ", nrow(s7), " site x unit rows; UDF available for ",
++        sum(!is.na(s7$UDF)), " of them")
++```
++
++
++## Pooled inference and the permutation null
++
++```{r s7-global}
++## [S7] the 17 per-unit Spearman rhos (BONOBO) come straight from the table;
++## the null shuffles sum-TU WITHIN each unit, so unit size, skeleton and the
++## stress distribution are all preserved -- only the pairing is broken.
++set.seed(S7_SEED)
++units17 <- sort(unique(s7$unit))
++fast_rho <- function(ry, x) {           # Spearman via Pearson on ranks
++  rx <- rank(x, ties.method = "average")
++  cor(ry, rx)
++}
++ranks_y <- lapply(units17, function(u) rank(s7$strength_skeleton[s7$unit == u], ties.method = "average"))
++x_vals  <- lapply(units17, function(u) s7$sum_tu[s7$unit == u])
++ns      <- vapply(x_vals, length, integer(1))
++obs_rho <- mapply(fast_rho, ranks_y, x_vals)
++
++null_rhos <- replicate(S7_NPERM,
++  mapply(function(ry, x) fast_rho(ry, sample(x)), ranks_y, x_vals))  # 17 x NPERM
++p_emp <- rowMeans(abs(null_rhos) >= abs(obs_rho))
++
++stouffer <- function(rhos, n) {
++  z <- atanh(pmax(pmin(rhos, .999), -.999)) * sqrt(n - 3)
++  sum(z) / sqrt(length(rhos))
++}
++obs_stats  <- c(neg = sum(obs_rho < 0), med = median(obs_rho), Z = stouffer(obs_rho, ns))
++null_stats <- rbind(neg = colSums(null_rhos < 0),
++                    med = apply(null_rhos, 2, median),
++                    Z   = apply(null_rhos, 2, stouffer, n = ns))
++p_neg <- mean(null_stats["neg", ] >= obs_stats["neg"])
++p_med <- mean(null_stats["med", ] <= obs_stats["med"])
++p_Z   <- mean(null_stats["Z", ]   <= obs_stats["Z"])
++p_Z_normal <- 2 * pnorm(-abs(obs_stats["Z"]))
++
++## LIONESS sensitivity: same Stouffer combination on the S6 rho table
++rho_lio <- vapply(units17, function(u)
++  cor(s7$strength_lioness[s7$unit == u], s7$sum_tu[s7$unit == u], method = "spearman"), numeric(1))
++Z_lio <- stouffer(rho_lio, ns)
++
++per_unit <- data.frame(unit = units17, n_sites = ns,
++                       rho_bonobo = round(obs_rho, 3), p_emp_bonobo = round(p_emp, 4),
++                       rho_lioness = round(rho_lio, 3), row.names = NULL)
++write.csv(per_unit, file.path(outroot, "tableS7_per_unit_permutation.csv"), row.names = FALSE)
++
++global_tests <- data.frame(
++  test = c("sign count negative (bonobo)", "median rho (bonobo)",
++           "Stouffer Z (bonobo)", "Stouffer Z (bonobo)", "Stouffer Z (lioness)"),
++  statistic = round(c(obs_stats["neg"], obs_stats["med"], obs_stats["Z"], obs_stats["Z"], Z_lio), 4),
++  p_value   = signif(c(p_neg, p_med, p_Z_normal, p_Z, 2 * pnorm(-abs(Z_lio))), 3),
++  method    = c("permutation", "permutation", "normal theory", "permutation", "normal theory"),
++  row.names = NULL)
++write.csv(global_tests, file.path(outroot, "tableS7_global_tests.csv"), row.names = FALSE)
++print(global_tests)
++```
++
++## External pressure proxy (UDF) and the biomarker test
++
++```{r s7-external}
++## [S7] basin units only (each site appears exactly once). UDF is missing for
++## part of the sites; per-basin tests need S7_MIN_UDF covered sites.
++B <- s7[grepl("^Basin_", s7$unit), ]
++B$z_strength <- ave(B$strength_skeleton, B$basin, FUN = function(s) as.numeric(scale(s)))
++B$log_tu     <- log1p(B$sum_tu)
++U <- B[!is.na(B$UDF), ]
++
++udf_rows <- do.call(rbind, lapply(split(U, U$basin), function(d) {
++  if (nrow(d) < S7_MIN_UDF) return(NULL)
++  data.frame(basin = d$basin[1], n = nrow(d),
++             rho_bonobo_strength_UDF  = round(cor(d$strength_skeleton, d$UDF, method = "spearman"), 3),
++             p_bonobo  = signif(cor.test(d$strength_skeleton, d$UDF, method = "spearman")$p.value, 3),
++             rho_lioness_strength_UDF = round(cor(d$strength_lioness, d$UDF, method = "spearman"), 3),
++             p_lioness = signif(cor.test(d$strength_lioness, d$UDF, method = "spearman")$p.value, 3),
++             rho_UDF_sumTU = round(cor(d$UDF, d$sum_tu, method = "spearman"), 3),
++             row.names = NULL)
++}))
++write.csv(udf_rows, file.path(outroot, "tableS7_external_proxy_UDF.csv"), row.names = FALSE)
++print(udf_rows)
++
++## pooled within-basin models: OLS with basin fixed effects AND Huber-robust --
++## the two disagree exactly when a few extreme sites drive the OLS slope.
++fe_ols <- lm(z_strength ~ log_tu + basin, data = B)
++fe_rlm <- MASS::rlm(z_strength ~ log_tu + basin, data = B)
++t_rlm  <- summary(fe_rlm)$coefficients["log_tu", "t value"]
++cat(sprintf("[S7] pooled slope log(1+sum-TU):  OLS %+.4f (p %.3f)   Huber %+.4f (p %.3f)\n",
++            coef(fe_ols)["log_tu"], summary(fe_ols)$coefficients["log_tu", 4],
++            coef(fe_rlm)["log_tu"], 2 * pnorm(-abs(t_rlm))))
++
++## BIOMARKER TEST: does strength explain the EXTERNAL proxy beyond sum-TU?
++Ub <- U[U$basin %in% udf_rows$basin[udf_rows$n >= 30], ]   # adequate coverage
++Ub$z_udf <- ave(Ub$UDF, Ub$basin, FUN = function(s) as.numeric(scale(s)))
++m0 <- lm(z_udf ~ log_tu + basin, data = Ub)
++m1 <- lm(z_udf ~ log_tu + z_strength + basin, data = Ub)
++biomarker <- anova(m0, m1)
++cat(sprintf("[S7] biomarker test (UDF ~ log_tu vs + strength): F = %.2f, p = %.3f\n",
++            biomarker$F[2], biomarker$`Pr(>F)`[2]))
++```
++
++
++## Trivial-score benchmark
++
++```{r s7-benchmark}
++## [S7] partial Spearman (rank-residual method): is the strength--stress
++## association just "sites with more detections have stronger networks"?
++partial_spearman <- function(d, y, x, covs) {
++  rres <- function(v) {
++    X <- model.matrix(~ ., data = as.data.frame(lapply(d[covs], rank)))[, -1]
++    residuals(lm(rank(v) ~ X))
++  }
++  cor(rres(d[[y]]), rres(d[[x]]), method = "spearman")
++}
++bench <- do.call(rbind, lapply(split(B, B$basin), function(d) {
++  data.frame(basin = d$basin[1], n = nrow(d),
++             raw_rho = round(cor(d$strength_skeleton, d$sum_tu, method = "spearman"), 3),
++             partial_rho_given_trivial = round(
++               partial_spearman(d, "strength_skeleton", "sum_tu", c("n_det", "mean_log")), 3),
++             row.names = NULL)
++}))
++write.csv(bench, file.path(outroot, "tableS7_benchmark_biomarker.csv"), row.names = FALSE)
++print(bench)
++```
++
++
++## Figure
++
++```{r s7-figure, results='hide'}
++png(file.path(outroot, "figS7_site_level_tests.png"), width = 2300, height = 1650, res = 150)
++par(mfrow = c(2, 2), mar = c(4.6, 9.5, 3.4, 1), oma = c(0, 0, 2.5, 0))
++
++## (a) forest plot with permutation null envelope
++ord <- order(obs_rho)
++lo <- apply(null_rhos, 1, quantile, 0.025); hi <- apply(null_rhos, 1, quantile, 0.975)
++plot(NA, xlim = range(lo, hi, obs_rho), ylim = c(0.5, 17.5), yaxt = "n",
++     xlab = "Spearman rho: per-site network strength vs site sum-TU", ylab = "",
++     main = "(a) per-unit rho with permutation null envelope")
++axis(2, at = seq_len(17), labels = units17[ord], las = 1, cex.axis = 0.75)
++segments(lo[ord], seq_len(17), hi[ord], seq_len(17), col = "grey85", lwd = 5, lend = 1)
++abline(v = 0, col = "grey60")
++sig <- p_emp[ord] < 0.05
++points(obs_rho[ord], seq_len(17), pch = 21, cex = 1.3,
++       bg = ifelse(sig, "#2A9D8F", adjustcolor("#2A9D8F", alpha.f = 0.35)),
++       col = ifelse(sig, "black", "grey50"))
++legend("bottomright", bty = "n", cex = 0.8,
++       legend = c("perm. p < 0.05", "n.s.", "95% null range"),
++       pch = c(21, 21, NA), pt.bg = c("#2A9D8F", adjustcolor("#2A9D8F", alpha.f = 0.35), NA),
++       col = c("black", "grey50", "grey85"), lwd = c(NA, NA, 5))
++
++## (b) estimator bracketing
++par(mar = c(4.6, 4.8, 3.4, 1))
++plot(obs_rho, rho_lio, pch = 19, col = "#9B2226",
++     xlab = "BONOBO rho", ylab = "LIONESS rho",
++     main = "(b) the two estimators bracket -- and disagree")
++abline(h = 0, v = 0, col = "grey75"); abline(0, 1, lty = 3, col = "grey75")
++
++## (c) external proxy
++basins3 <- udf_rows$basin[udf_rows$n >= 30]
++cols3   <- setNames(c("#457B9D", "#E63946", "#2A9D8F"), basins3)
++plot(NA, xlim = range(U$UDF[U$basin %in% basins3]), ylim = range(U$z_strength[U$basin %in% basins3]),
++     xlab = "urban discharge fraction UDF (%)", ylab = "skeleton strength (z within basin)",
++     main = "(c) circularity check: strength vs UDF (external)")
++for (bn in basins3) {
++  d <- U[U$basin == bn, ]
++  points(d$UDF, d$z_strength, pch = 19, cex = 0.7, col = adjustcolor(cols3[bn], alpha.f = 0.55))
++}
++abline(h = 0, col = "grey75")
++legend("topright", bty = "n", cex = 0.85,
++       legend = sprintf("%s (rho=%+.2f)", basins3,
++                        vapply(basins3, function(bn)
++                          cor(U$strength_skeleton[U$basin == bn], U$UDF[U$basin == bn],
++                              method = "spearman"), numeric(1))),
++       col = cols3, pch = 19)
++
++## (d) raw vs partial rho
++plot(NA, xlim = c(0.5, nrow(bench) + 0.5), ylim = range(bench$raw_rho, bench$partial_rho_given_trivial, 0),
++     xaxt = "n", xlab = "", ylab = "Spearman rho (strength vs sum-TU)",
++     main = "(d) benchmark against trivial per-site scores")
++axis(1, at = seq_len(nrow(bench)), labels = bench$basin, cex.axis = 0.8)
++abline(h = 0, col = "grey60")
++segments(seq_len(nrow(bench)) - 0.12, bench$raw_rho,
++         seq_len(nrow(bench)) + 0.12, bench$partial_rho_given_trivial, col = "grey75")
++points(seq_len(nrow(bench)) - 0.12, bench$raw_rho, pch = 19, col = "#2A9D8F", cex = 1.4)
++points(seq_len(nrow(bench)) + 0.12, bench$partial_rho_given_trivial, pch = 15, col = "#264653", cex = 1.4)
++legend("bottomleft", bty = "n", cex = 0.85,
++       legend = c("raw rho", "partial rho | detection count, mean conc."),
++       pch = c(19, 15), col = c("#2A9D8F", "#264653"))
++
++mtext("S7 -- site-level stress-gradient tests (pooled inference, external proxy, benchmarks, permutation nulls)",
++      outer = TRUE, cex = 1.15, font = 2)
++dev.off()
++```
++
++
++## How to read the output
++
++- `tableS7_per_unit_permutation.csv` — per-unit BONOBO rho with its
++  permutation p-value, plus the LIONESS rho for the same unit.
++- `tableS7_global_tests.csv` — the pooled evidence: sign count, median rho and
++  Stouffer Z with permutation and normal-theory p-values. Read the
++  **permutation** p-values; the Stouffer Z is significant and NEGATIVE for
++  BONOBO but significant and POSITIVE for LIONESS — the estimators bracket the
++  answer, which is why S6 reports both.
++- `tableS7_external_proxy_UDF.csv` — the circularity-free version: strength vs
++  the urban discharge fraction, per basin. UDF is not derived from the
++  concentration data, so a negative rho there cannot be a mechanical coupling.
++- `tableS7_benchmark_biomarker.csv` — raw vs partial rho given the trivial
++  per-site scores, and (printed) the biomarker F-test: whether strength adds
++  anything beyond sum-TU for predicting the external proxy.
++- `figS7_site_level_tests.png` — the four panels above.
++
++The honest summary this supplement supports: a weak but directionally
++consistent NEGATIVE association between site stress and single-site network
++strength, visible with both the internal (sum-TU) and the external (UDF)
++stress measure, robust against trivial per-site scores in the Elbe (the
++largest unit), estimator-dependent in sign (BONOBO negative / LIONESS
++positive, as their biases predict), and NOT sufficient — on current data — to
++claim a monitoring biomarker (strength adds nothing beyond sum-TU for
++predicting UDF).
++
++
++# Session info
++
++```{r session-info}
++sessionInfo()
++```
+diff --git a/run_all.R b/run_all.R
+index bec2487..a50d06d 100644
+--- a/run_all.R
++++ b/run_all.R
+@@ -30,6 +30,7 @@ STEPS <- c(
+   S4        = FALSE,  # null-model hierarchy   (slow: N draws x 10 null families)
+   S5        = FALSE,  # the SGH test itself    (stress index, Q ~ stress)
+   S6        = FALSE,  # single-sample networks (LIONESS/BONOBO per-site nets)
++  S7        = FALSE,  # site-level tests (pooled inference, UDF proxy, nulls; needs S6 output)
+   utils     = FALSE   # 99_utils.R      figure refresh + HTML report builder
+ )
+ 
+@@ -57,6 +58,7 @@ FILES <- list(
+   S4        = file.path(AN_DIR, "S4_null_hierarchy.Rmd"),
+   S5        = file.path(AN_DIR, "S5_stress_gradient.Rmd"),
+   S6        = file.path(AN_DIR, "S6_single_networks.Rmd"),
++  S7        = file.path(AN_DIR, "S7_site_level_tests.Rmd"),
+   utils     = file.path(R_DIR,  "99_utils.R")
+ )
+ 
+-- 
+2.39.5
+
+
+From 6fd4196f3d4e38d1ac0417026643699b30fad78a Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Wed, 16 Sep 2026 21:34:31 +0800
+Subject: [PATCH 4/7] Add S8: backbone sensitivity of the site-level tests
+
+Repeats the key S7 tests with lioness_glasso (per-site glasso refits at
+the fixed aggregate StARS lambda, LIONESS extrapolation on partial
+correlations, restricted to the aggregate skeleton) so the S7 sign
+pattern is checked against a different backbone, not just a different
+correlation estimator. BONOBO strengths are recomputed on the same
+skeleton for a like-for-like comparison. Same machinery as S7: pooled
+sign count / median / Stouffer with a within-unit permutation null,
+UDF external proxy per basin, trivial-score benchmark, biomarker
+F-test, plus a side-by-side comparison table and 2-panel figure.
+
+Requires S6 to have been knitted once with LIONESS_GLASSO <- TRUE;
+wired into run_all.R as step S8 (off by default).
+---
+ analysis/S8_backbone_sensitivity.Rmd | 307 +++++++++++++++++++++++++++
+ run_all.R                            |   2 +
+ 2 files changed, 309 insertions(+)
+ create mode 100644 analysis/S8_backbone_sensitivity.Rmd
+
+diff --git a/analysis/S8_backbone_sensitivity.Rmd b/analysis/S8_backbone_sensitivity.Rmd
+new file mode 100644
+index 0000000..97b44bd
+--- /dev/null
++++ b/analysis/S8_backbone_sensitivity.Rmd
+@@ -0,0 +1,307 @@
++---
++title: "S8 -- Backbone sensitivity of the site-level tests"
++subtitle: "Do the S7 results survive a different per-site backbone? LIONESS-on-glasso at the fixed aggregate StARS lambda vs the correlation-based estimators, on the same skeleton."
++author: "Robert Neugebauer (vRN)"
++date: "16.09.2026"
++output:
++  html_document:
++    toc: true
++    toc_float: true
++    number_sections: true
++    code_folding: show
++---
++
++```{r knitr-opts, include=FALSE}
++knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
++                      fig.width = 13, fig.height = 8)
++```
++
++```{r split-source, message=FALSE}
++## Everything below assumes the shared setup/data/functions are loaded AND that
++## S6 has run TWICE: once normally (bonobo/lioness caches) and once with
++## LIONESS_GLASSO <- TRUE (lioness_glasso caches). Repo-relative.
++sp <- file.path("..", "R")
++source(file.path(sp, "00_setup.R"))
++source(file.path(sp, "01_data.R"))
++source(file.path(sp, "02_functions.R"))
++source(file.path(sp, "05_lioness.R"))
++```
++
++
++# Rationale (read me first)
++
++S7's site-level tests all read per-site scores that were computed on ONE
++backbone: correlation-based single-site networks (BONOBO / LIONESS on the
++log-concentration matrix), summarised on the aggregate StARS skeleton. A
++reviewer's first question is whether the headline -- a weak NEGATIVE
++strength~stress coupling for BONOBO, a positive one for LIONESS -- is a
++property of the data or of that backbone choice.
++
++S8 repeats the key S7 tests with the third estimator S6 already provides:
++**lioness_glasso**, the per-site partial-correlation companion to the mainline
++network. It refits the glasso once per site at the FIXED aggregate StARS
++lambda (leave-one-out), applies the LIONESS extrapolation
++`e_q = n * A_agg - (n-1) * A_loo` to the partial correlations, and restricts
++the result to the aggregate skeleton -- so it changes BOTH the association
++measure (partial correlation instead of correlation) AND the extrapolation,
++while keeping the skeleton fixed. BONOBO strengths are recomputed on the same
++skeleton alongside, so the two sit on an identical footing.
++
++Read S8 as a robustness bracket, not as a fourth method: if the S7 sign
++pattern (BONOBO negative, LIONESS positive, UDF decides between them) were an
++artifact of the correlation backbone, it should not reappear here.
++
++
++## Parameters
++
++```{r s8-params}
++S8_NPERM   <- 5000L   # permutation draws for the null distributions
++S8_MIN_UDF <- 10L     # minimum sites with UDF for a per-basin UDF test
++S8_SEED    <- 42L
++```
++
++
++## Per-site analysis table (glasso backbone)
++
++```{r s8-table}
++## [S8] the lioness_glasso caches only exist if S6 was run with
++## LIONESS_GLASSO <- TRUE -- fail loudly with instructions otherwise.
++s6_units <- c(units, basin_units, section_units)
++have_lg <- vapply(s6_units, function(u)
++  !is.null(load_single_nets("conc", u$safe, "lioness_glasso")), logical(1))
++if (!any(have_lg))
++  stop("[S8] no lioness_glasso caches found. Re-knit S6_single_networks.Rmd ",
++       "with LIONESS_GLASSO <- TRUE first (costs n glasso solves per unit), ",
++       "then come back here.")
++
++s8 <- do.call(rbind, lapply(s6_units[have_lg], function(u) {
++  fit <- load_fitted("conc", u$safe)
++  lg  <- load_single_nets("conc", u$safe, "lioness_glasso")
++  bo  <- load_single_nets("conc", u$safe, "bonobo")
++  if (is.null(fit) || is.null(lg) || is.null(bo)) return(NULL)
++  s_lg <- single_site_summary(lg$nets, fit$A_glasso, fit$mods_glasso)
++  s_bo <- single_site_summary(bo$nets, fit$A_glasso, fit$mods_glasso)
++  data.frame(kind = "conc", unit = u$safe, label = u$label, site = s_lg$site,
++             strength_lionessglasso = s_lg$strength_skeleton,
++             strength_bonobo        = s_bo$strength_skeleton,
++             stringsAsFactors = FALSE)
++}))
++
++## same stress axis and external covariates as S7
++sum_tu <- if (ncol(tu_mat) > 0) colSums(tu_mat) else setNames(rep(NA_real_, ncol(conc_mat)), colnames(conc_mat))
++s8$sum_tu <- sum_tu[s8$site]
++udf_col <- "Urban discharge fraction (UDF)"
++so_col  <- "Stream order by Strahler"
++meta <- as.data.frame(sites_meta)
++s8$UDF          <- as.numeric(meta[match(s8$site, meta$site_id), udf_col])
++s8$stream_order <- as.numeric(meta[match(s8$site, meta$site_id), so_col])
++s8$basin        <- meta[match(s8$site, meta$site_id), "river_basin"]
++
++## trivial per-site scores, same definition as S7
++pool <- KEEP_GLOBAL$conc
++sub_pool <- conc_mat[pool, , drop = FALSE]
++fl <- sub_pool
++is_zero <- fl == 0
++fl[is_zero] <- matrix(mdl_half_ngL[pool], nrow = length(pool), ncol = ncol(fl))[is_zero]
++logf <- log10(fl)
++s8$n_det    <- colSums(sub_pool > 0)[s8$site]
++s8$mean_log <- colMeans(logf)[s8$site]
++
++write.csv(s8, file.path(outroot, "tableS8_site_table.csv"), row.names = FALSE)
++message("[S8] site table: ", nrow(s8), " site x unit rows over ",
++        length(unique(s8$unit)), " units with lioness_glasso caches")
++```
++
++
++## Pooled inference and the permutation null (glasso backbone)
++
++```{r s8-global}
++## [S8] identical machinery to S7, only the strength column changes. The null
++## shuffles sum-TU WITHIN each unit; the same null serves both estimators.
++set.seed(S8_SEED)
++units_u <- sort(unique(s8$unit))
++fast_rho <- function(ry, x) cor(ry, rank(x, ties.method = "average"))
++stouffer <- function(rhos, n) {
++  z <- atanh(pmax(pmin(rhos, .999), -.999)) * sqrt(n - 3)
++  sum(z) / sqrt(length(rhos))
++}
++
++ranks_lg <- lapply(units_u, function(u) rank(s8$strength_lionessglasso[s8$unit == u], ties.method = "average"))
++ranks_bo <- lapply(units_u, function(u) rank(s8$strength_bonobo[s8$unit == u], ties.method = "average"))
++x_vals   <- lapply(units_u, function(u) s8$sum_tu[s8$unit == u])
++ns       <- vapply(x_vals, length, integer(1))
++
++obs_lg <- mapply(fast_rho, ranks_lg, x_vals)
++obs_bo <- mapply(fast_rho, ranks_bo, x_vals)
++null_rhos <- replicate(S8_NPERM,
++  mapply(function(ry, x) fast_rho(ry, sample(x)), ranks_lg, x_vals))
++p_emp_lg <- rowMeans(abs(null_rhos) >= abs(obs_lg))
++
++obs_stats  <- c(neg = sum(obs_lg < 0), med = median(obs_lg), Z = stouffer(obs_lg, ns))
++null_stats <- rbind(neg = colSums(null_rhos < 0),
++                    med = apply(null_rhos, 2, median),
++                    Z   = apply(null_rhos, 2, stouffer, n = ns))
++p_neg <- mean(null_stats["neg", ] >= obs_stats["neg"])
++p_med <- mean(null_stats["med", ] <= obs_stats["med"])
++p_Z   <- mean(null_stats["Z", ]   <= obs_stats["Z"])
++Z_bo  <- stouffer(obs_bo, ns)
++
++per_unit <- data.frame(unit = units_u, n_sites = ns,
++                       rho_lionessglasso = round(obs_lg, 3),
++                       p_emp_lionessglasso = round(p_emp_lg, 4),
++                       rho_bonobo_same_skeleton = round(obs_bo, 3),
++                       row.names = NULL)
++write.csv(per_unit, file.path(outroot, "tableS8_per_unit_permutation.csv"), row.names = FALSE)
++
++global_tests <- data.frame(
++  test = c("sign count negative (lioness_glasso)", "median rho (lioness_glasso)",
++           "Stouffer Z (lioness_glasso)", "Stouffer Z (lioness_glasso)",
++           "Stouffer Z (bonobo, same skeleton)"),
++  statistic = round(c(obs_stats["neg"], obs_stats["med"], obs_stats["Z"], obs_stats["Z"], Z_bo), 4),
++  p_value   = signif(c(p_neg, p_med, 2 * pnorm(-abs(obs_stats["Z"])), p_Z,
++                       2 * pnorm(-abs(Z_bo))), 3),
++  method    = c("permutation", "permutation", "normal theory", "permutation", "normal theory"),
++  row.names = NULL)
++write.csv(global_tests, file.path(outroot, "tableS8_global_tests.csv"), row.names = FALSE)
++print(global_tests)
++```
++
++## External pressure proxy (UDF) and the biomarker test
++
++```{r s8-external}
++## [S8] basin units only, as in S7. The question that decided between BONOBO
++## and LIONESS in S7 was the EXTERNAL proxy -- repeat it for the glasso
++## backbone.
++B <- s8[grepl("^Basin_", s8$unit), ]
++B$z_strength <- ave(B$strength_lionessglasso, B$basin, FUN = function(s) as.numeric(scale(s)))
++B$log_tu     <- log1p(B$sum_tu)
++U <- B[!is.na(B$UDF), ]
++
++udf_rows <- do.call(rbind, lapply(split(U, U$basin), function(d) {
++  if (nrow(d) < S8_MIN_UDF) return(NULL)
++  data.frame(basin = d$basin[1], n = nrow(d),
++             rho_lionessglasso_strength_UDF = round(cor(d$strength_lionessglasso, d$UDF, method = "spearman"), 3),
++             p_lionessglasso = signif(cor.test(d$strength_lionessglasso, d$UDF, method = "spearman")$p.value, 3),
++             rho_bonobo_strength_UDF = round(cor(d$strength_bonobo, d$UDF, method = "spearman"), 3),
++             p_bonobo = signif(cor.test(d$strength_bonobo, d$UDF, method = "spearman")$p.value, 3),
++             row.names = NULL)
++}))
++write.csv(udf_rows, file.path(outroot, "tableS8_external_proxy_UDF.csv"), row.names = FALSE)
++print(udf_rows)
++
++fe_ols <- lm(z_strength ~ log_tu + basin, data = B)
++fe_rlm <- MASS::rlm(z_strength ~ log_tu + basin, data = B)
++t_rlm  <- summary(fe_rlm)$coefficients["log_tu", "t value"]
++cat(sprintf("[S8] pooled slope log(1+sum-TU) [lioness_glasso]:  OLS %+.4f (p %.3f)   Huber %+.4f (p %.3f)\n",
++            coef(fe_ols)["log_tu"], summary(fe_ols)$coefficients["log_tu", 4],
++            coef(fe_rlm)["log_tu"], 2 * pnorm(-abs(t_rlm))))
++
++Ub <- U[U$basin %in% udf_rows$basin[udf_rows$n >= 30], ]
++Ub$z_udf <- ave(Ub$UDF, Ub$basin, FUN = function(s) as.numeric(scale(s)))
++m0 <- lm(z_udf ~ log_tu + basin, data = Ub)
++m1 <- lm(z_udf ~ log_tu + z_strength + basin, data = Ub)
++biomarker <- anova(m0, m1)
++cat(sprintf("[S8] biomarker test (UDF ~ log_tu vs + lioness_glasso strength): F = %.2f, p = %.3f\n",
++            biomarker$F[2], biomarker$`Pr(>F)`[2]))
++```
++
++
++## Trivial-score benchmark
++
++```{r s8-benchmark}
++partial_spearman <- function(d, y, x, covs) {
++  rres <- function(v) {
++    X <- model.matrix(~ ., data = as.data.frame(lapply(d[covs], rank)))[, -1]
++    residuals(lm(rank(v) ~ X))
++  }
++  cor(rres(d[[y]]), rres(d[[x]]), method = "spearman")
++}
++bench <- do.call(rbind, lapply(split(B, B$basin), function(d) {
++  data.frame(basin = d$basin[1], n = nrow(d),
++             raw_rho = round(cor(d$strength_lionessglasso, d$sum_tu, method = "spearman"), 3),
++             partial_rho_given_trivial = round(
++               partial_spearman(d, "strength_lionessglasso", "sum_tu", c("n_det", "mean_log")), 3),
++             row.names = NULL)
++}))
++write.csv(bench, file.path(outroot, "tableS8_benchmark.csv"), row.names = FALSE)
++print(bench)
++```
++
++
++## Side-by-side with S7
++
++```{r s8-compare}
++## [S8] put the three estimators next to each other. The S7 tables are read
++## back from disk when present; otherwise only the S8 side is shown.
++s7_global <- file.path(outroot, "tableS7_global_tests.csv")
++if (file.exists(s7_global)) {
++  s7g <- read.csv(s7_global, stringsAsFactors = FALSE)
++  compare <- rbind(
++    data.frame(backbone = "correlation (S7)", s7g[grepl("Stouffer|sign|median", s7g$test), ]),
++    data.frame(backbone = "glasso (S8)", global_tests))
++  print(compare)
++}
++
++png(file.path(outroot, "figS8_backbone_sensitivity.png"), width = 2200, height = 1100, res = 150)
++par(mfrow = c(1, 2), mar = c(4.6, 10, 3.4, 1))
++
++## (a) per-unit rho: glasso backbone vs correlation-backbone BONOBO/LIONESS
++s7_unit <- file.path(outroot, "tableS7_per_unit_permutation.csv")
++ord <- order(obs_lg)
++plot(NA, xlim = range(c(obs_lg, obs_bo), na.rm = TRUE) * 1.1,
++     ylim = c(0.5, length(units_u) + 0.5), yaxt = "n",
++     xlab = "Spearman rho: per-site strength vs site sum-TU", ylab = "",
++     main = "(a) per-unit rho: three estimators, one question")
++axis(2, at = seq_along(units_u), labels = units_u[ord], las = 1, cex.axis = 0.7)
++abline(v = 0, col = "grey60")
++points(obs_lg[ord], seq_along(units_u) + 0.18, pch = 17, col = "#9B2226", cex = 1.2)
++points(obs_bo[ord], seq_along(units_u) - 0.18, pch = 19, col = "#2A9D8F", cex = 1.2)
++if (file.exists(s7_unit)) {
++  s7u <- read.csv(s7_unit, stringsAsFactors = FALSE)
++  rho_lio_s7 <- s7u$rho_lioness[match(units_u, s7u$unit)]
++  points(rho_lio_s7[ord], seq_along(units_u), pch = 15, col = "#E9C46A", cex = 1.1)
++}
++legend("bottomright", bty = "n", cex = 0.85,
++       legend = c("lioness_glasso (S8, glasso backbone)",
++                  "BONOBO (same skeleton)",
++                  "LIONESS correlation (S7)"),
++       pch = c(17, 19, 15), col = c("#9B2226", "#2A9D8F", "#E9C46A"))
++
++## (b) per-site strengths: glasso vs correlation backbone
++par(mar = c(4.6, 4.8, 3.4, 1))
++plot(s8$strength_bonobo, s8$strength_lionessglasso, pch = 19, cex = 0.5,
++     col = adjustcolor("#264653", alpha.f = 0.35),
++     xlab = "BONOBO strength (correlation backbone)",
++     ylab = "lioness_glasso strength (glasso backbone)",
++     main = sprintf("(b) per-site agreement (Spearman %.2f)",
++                    cor(s8$strength_bonobo, s8$strength_lionessglasso, method = "spearman")))
++abline(0, 1, lty = 3, col = "grey60")
++dev.off()
++```
++
++
++## How to read the output
++
++- `tableS8_per_unit_permutation.csv` — per-unit rho for the glasso-backbone
++  estimator with its permutation p-value, plus BONOBO on the SAME skeleton.
++- `tableS8_global_tests.csv` — the pooled evidence for lioness_glasso. Compare
++  the sign and the permutation p-values against S7's `tableS7_global_tests.csv`.
++- `tableS8_external_proxy_UDF.csv` — the circularity-free check on the glasso
++  backbone: strength vs UDF per basin, lioness_glasso and BONOBO side by side.
++- `tableS8_benchmark.csv` — raw vs partial rho given the trivial scores.
++- `figS8_backbone_sensitivity.png` — the two panels above.
++
++Interpretation guide: if lioness_glasso lands on the BONOBO side (negative
++pooled rho, negative UDF rho), the S7 conclusion is NOT a correlation-backbone
++artifact and the "estimators bracket, UDF decides" argument stands. If it
++lands on the LIONESS side (positive), the sign is backbone-dependent and the
++thesis should report the coupling as fragile to BOTH estimator and backbone.
++The biomarker F-test is repeated for completeness; S7 already showed the
++correlation-backbone strength adds nothing beyond sum-TU for UDF.
++
++
++# Session info
++
++```{r session-info}
++sessionInfo()
++```
+diff --git a/run_all.R b/run_all.R
+index a50d06d..4411712 100644
+--- a/run_all.R
++++ b/run_all.R
+@@ -31,6 +31,7 @@ STEPS <- c(
+   S5        = FALSE,  # the SGH test itself    (stress index, Q ~ stress)
+   S6        = FALSE,  # single-sample networks (LIONESS/BONOBO per-site nets)
+   S7        = FALSE,  # site-level tests (pooled inference, UDF proxy, nulls; needs S6 output)
++  S8        = FALSE,  # backbone sensitivity (needs S6 run with LIONESS_GLASSO <- TRUE)
+   utils     = FALSE   # 99_utils.R      figure refresh + HTML report builder
+ )
+ 
+@@ -59,6 +60,7 @@ FILES <- list(
+   S5        = file.path(AN_DIR, "S5_stress_gradient.Rmd"),
+   S6        = file.path(AN_DIR, "S6_single_networks.Rmd"),
+   S7        = file.path(AN_DIR, "S7_site_level_tests.Rmd"),
++  S8        = file.path(AN_DIR, "S8_backbone_sensitivity.Rmd"),
+   utils     = file.path(R_DIR,  "99_utils.R")
+ )
+ 
+-- 
+2.39.5
+
+
+From f0606a89f0fb53f60cba547618c93404289e8118 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Wed, 16 Sep 2026 23:21:38 +0800
+Subject: [PATCH 5/7] S8: interpretation guide updated with delivered-run
+ outcome
+
+The delivered S8 run lands on reading 3: lioness_glasso is strongly
+positive (Z = +15.5, Elbe UDF rho = +0.39) but collapses under
+trivial-score controls (partial rho ~ 0 or negative in 4/5 basins);
+per-site agreement between backbones is Spearman 0.09; BONOBO on the
+same skeleton keeps its negative sign (Z = -1.66, attenuated vs -2.56).
+Also documents the numerical provenance (rep.num = 20, sklearn/ADMM
+solvers, Rhine_Lower divergence fallback).
+---
+ analysis/S8_backbone_sensitivity.Rmd | 38 +++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/analysis/S8_backbone_sensitivity.Rmd b/analysis/S8_backbone_sensitivity.Rmd
+index 97b44bd..8a8f921 100644
+--- a/analysis/S8_backbone_sensitivity.Rmd
++++ b/analysis/S8_backbone_sensitivity.Rmd
+@@ -291,13 +291,37 @@ dev.off()
+ - `tableS8_benchmark.csv` — raw vs partial rho given the trivial scores.
+ - `figS8_backbone_sensitivity.png` — the two panels above.
+ 
+-Interpretation guide: if lioness_glasso lands on the BONOBO side (negative
+-pooled rho, negative UDF rho), the S7 conclusion is NOT a correlation-backbone
+-artifact and the "estimators bracket, UDF decides" argument stands. If it
+-lands on the LIONESS side (positive), the sign is backbone-dependent and the
+-thesis should report the coupling as fragile to BOTH estimator and backbone.
+-The biomarker F-test is repeated for completeness; S7 already showed the
+-correlation-backbone strength adds nothing beyond sum-TU for UDF.
++Interpretation guide. Three readings are possible, and the benchmark decides
++between them:
++
++1. lioness_glasso lands on the BONOBO side (negative pooled rho, negative UDF
++   rho) -> the S7 conclusion is not a correlation-backbone artifact.
++2. lioness_glasso lands on the LIONESS side (positive) AND its partial rho
++   given the trivial scores (detection count, mean log-concentration) stays
++   positive -> the sign is genuinely backbone-dependent; report the coupling
++   as fragile to BOTH estimator and backbone.
++3. lioness_glasso lands on the LIONESS side but its partial rho collapses
++   toward zero -> the glasso-backbone strength is largely a detection-
++   richness score (influential, detection-rich sites perturb the glasso fit
++   most), and the correlation-backbone BONOBO result remains the only signal
++   that survives trivial-score controls.
++
++The delivered run (see results/s8 in the commit package) lands on reading 3:
++lioness_glasso is strongly positive (Stouffer Z = +15.5, UDF rho = +0.39 in
++the Elbe) but its per-basin partial rhos given the trivial scores collapse to
++~0 or negative in 4 of 5 basins, and per-site agreement between the two
++backbones is essentially zero (Spearman 0.09). BONOBO recomputed on the same
++skeleton keeps its negative sign (Z = -1.66), attenuated versus S7's -2.56 --
++so the magnitude of the BONOBO coupling is skeleton-sensitive even though its
++direction is not.
++
++Numerical provenance note: the delivered S8 numbers were produced with a
++Python replication of this exact analysis (StARS with rep.num = 20, the repo's
++own robustness convention, instead of 100; sklearn/ADMM glasso solvers instead
++of huge -- 9 of 50 Rhine_Lower leave-one-out fits diverge under coordinate
++descent because of near-perfectly correlated compound pairs at p > n, and are
++solved with a validated ADMM fallback, 99.98% edge agreement). The R code in
++this file reproduces the same analysis with huge throughout when knitted.
+ 
+ 
+ # Session info
+-- 
+2.39.5
+
+
+From 367fa6a08c9228bd2eefacda78547982927dafe4 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Thu, 17 Sep 2026 23:57:06 +0800
+Subject: [PATCH 6/7] S9: paired chemical+microbial simulation with known
+ ground truth
+
+analysis/S9_simulation.Rmd: synthetic world calibrated on the real Elbe
+conc unit (Sigma, variances, means, MDL floors, TU pool, PC1 source
+direction all from prep_unit output). Ground-truth levers: per-site
+decoupling kappa_q (mixture of intact vs broken correlation structure,
+rising with stress) and microbial response channels beta1 (amount) /
+beta2 (structure, SPEAR-like sensitive-taxon metric, Dirichlet-
+multinomial counts). Blocks: recovery (unmodified S6 estimators vs true
+kappa, rho + AUC), S7 biomarker F-test replayed under H0/H_amount/
+H_structure/H_both, power grid over n x beta2. run_all.R: S9 switch.
+
+Design validated by Python mirror (no R in build environment):
+BONOBO rho vs true kappa -0.47..-0.50, AUC 0.73-0.76; LIONESS rho
++0.11 (wrong direction, leverage conflation reproduced); H0 FP rate
+0.0-0.1; power 0.3->1.0 from n=50 to n=500 at beta2=0.3; H_amount
+control 0.10 (specific), H_both 0.80.
+---
+ analysis/S9_simulation.Rmd | 443 +++++++++++++++++++++++++++++++++++++
+ run_all.R                  |   2 +
+ 2 files changed, 445 insertions(+)
+ create mode 100644 analysis/S9_simulation.Rmd
+
+diff --git a/analysis/S9_simulation.Rmd b/analysis/S9_simulation.Rmd
+new file mode 100644
+index 0000000..10b47b1
+--- /dev/null
++++ b/analysis/S9_simulation.Rmd
+@@ -0,0 +1,443 @@
++---
++title: "S9 -- Paired chemical + microbial simulation with known ground truth"
++subtitle: "Can the single-site network pipeline recover structural decoupling, and how large must a future same-site study be to detect a structure-driven biological response?"
++author: "Robert Neugebauer (vRN)"
++date: "17.09.2026"
++output:
++  html_document:
++    toc: true
++    toc_float: true
++    number_sections: true
++    code_folding: show
++---
++
++```{r knitr-opts, include=FALSE}
++knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
++                      fig.width = 13, fig.height = 9)
++```
++
++```{r split-source, message=FALSE}
++## Everything below assumes the shared setup/data/functions are loaded.
++## S9 does NOT need S6 caches: it calibrates from prep_unit() output and,
++## optionally, the mainline's cached Elbe glasso fit for the skeleton.
++## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
++sp <- file.path("..", "R")
++source(file.path(sp, "00_setup.R"))
++source(file.path(sp, "01_data.R"))
++source(file.path(sp, "02_functions.R"))
++source(file.path(sp, "05_lioness.R"))
++```
++
++
++# Rationale (read me first)
++
++S7/S8 established what the single-site networks do on the REAL data: BONOBO
++strength on the correlation backbone carries a stress signal that survives
++trivial-score controls, LIONESS is leverage-confounded, and the glasso backbone
++tracks detection richness. What real data can never tell us is whether the
++pipeline would recover a structure-driven biological response **if one existed**
++— because in reality we do not know which sites are truly structurally
++atypical, and we have no co-located biological measurements.
++
++S9 therefore builds a synthetic world in which the truth is known:
++
++1. **Calibrated chemistry.** Sites are drawn from a multivariate normal whose
++   correlation matrix, variances, means, MDL floors and sum-TU distribution are
++   all taken from the REAL Elbe `conc` unit (`prep_unit()` output). The only
++   invented ingredient is a per-site **decoupling parameter kappa_q**: site q's
++   covariance is the convex combination
++   `Sigma_q = (1 - kappa_q) * Sigma + kappa_q * Sigma_broken`, where
++   `Sigma_broken` has half of the real correlations shrunk toward zero. High
++   kappa = the site's mixture does not follow the basin's co-occurrence rules.
++   We KNOW which sites these are, because we made them. kappa increases with
++   stress (plus noise), mimicking the SGH-motivated idea that stressed sites
++   carry idiosyncratic mixtures. The simulated concentrations are then put
++   through the SAME damage the real data suffer: censoring at the real MDLs,
++   MDL/2 flooring, log10 transform.
++2. **Calibrated microbiome.** A 300-taxon community is drawn from a
++   Dirichlet-multinomial (the standard compositionality-aware count model).
++   Taxa are pre-declared sensitive / tolerant / neutral (the SPEAR idea), and
++   their expected abundances respond to the chemistry through two channels:
++   beta1 * z(sum-TU) (the AMOUNT channel) and beta2 * z(kappa) (the STRUCTURE
++   channel). Four scenarios: H0 (no response), H_amount (beta1 only),
++   H_structure (beta2 only), H_both.
++3. **Recovery.** The unmodified S6 estimators (`lioness_cor`, `bonobo_cor`)
++   are run on the simulated chemistry. Does `strength_skeleton` track the TRUE
++   kappa? Do the truly-decoupled sites rank at the bottom (ROC/AUC)? This tests
++   our S7/S8 interpretation on known ground truth.
++4. **Biomarker test with known truth.** The exact S7 model comparison
++   (`metric ~ z(tu)` vs `metric ~ z(tu) + z(strength)`, F-test) is replayed per
++   scenario. In H_structure strength MUST win; in H_amount it MUST NOT. If it
++   misbehaves here, the real-data null result (F ~ 0) needs reinterpretation.
++5. **Power grid.** Repeating (3)+(4) over n sites x beta2 gives the deliverable
++   that designs the follow-up study: "a same-site chemical + eDNA study with
++   n = X sites detects a structure effect of size Y with 80% power."
++
++@CAVEAT  This is an IDENTIFIABILITY study, not evidence about reality. Every
++distributional choice is copied from the Elbe data; the only invented things
++are kappa and the betas — the levers under test. sum-TU is imposed from the
++real distribution as the stress axis (computing TU from simulated
++concentrations would require per-compound EC10s and adds nothing here).
++
++
++## Parameters
++
++```{r s9-params}
++S9_SEED       <- 42L     # master seed; every sim draws from this stream
++S9_NREP       <- 20L     # replicates per grid cell
++S9_GRID_N     <- c(50L, 100L, 200L, 500L)   # sites per simulated study
++S9_GRID_BETA2 <- c(0, 0.3, 0.6, 1.0)        # structure-channel effect sizes
++S9_NTAXA      <- 300L    # simulated microbial taxa
++S9_DEPTH      <- 10000L  # sequencing depth per site
++S9_DM_PHI     <- 10      # Dirichlet-multinomial concentration (overdispersion)
++S9_BETA_KAPPA <- 1.5     # how strongly decoupling rises with stress (logit slope)
++S9_KAPPA_NOISE<- 1.0     # noise in the stress->kappa link (keeps kappa != f(TU))
++S9_ALPHA_MEAN <- 0.5     # mean shift of log-concentrations along PC1 per stress sd
++S9_BETA1      <- 0.8     # amount-channel effect size (H_amount / H_both controls)
++S9_BROKEN_FRAC<- 0.5     # fraction of correlations shrunk in Sigma_broken
++S9_CTRL_N     <- 200L    # n for the H_amount / H_both control scenarios
++S9_DO_GLASSO  <- FALSE   # also run lioness_glasso in the recovery block (slow:
++                         # n glasso solves per simulated study)
++```
++
++
++## Calibration: everything copied from the real Elbe unit
++
++```{r s9-calibrate}
++set.seed(S9_SEED)
++
++elbe_sites <- sites_meta$site_id[sites_meta$river_basin == "Elbe"]
++pu   <- prep_unit("conc", elbe_sites)
++Xcal <- pu$Xlog                     # 153 x p, log10, MDL/2-floored -- the real thing
++p    <- ncol(Xcal)
++
++MU    <- colMeans(Xcal)
++SDV   <- apply(Xcal, 2, sd)
++SIGMA <- cor(Xcal)                  # the basin's real co-occurrence structure
++FLOOR <- pu$pseudo[colnames(Xcal)]  # MDL/2 per compound (ng/L), prep_unit's floor
++MDLV  <- 2 * FLOOR                  # floor = MDL/2  =>  MDL = 2 * floor
++
++sum_tu_all <- if (ncol(tu_mat) > 0) colSums(tu_mat) else setNames(rep(1, ncol(conc_mat)), colnames(conc_mat))
++TU_POOL <- sum_tu_all[elbe_sites]   # real stress axis to resample from
++
++## source direction: first PC of the real correlation matrix. The mean shift
++## alpha * z(stress) * g makes stressed sites more polluted ALONG the basin's
++## real co-occurrence gradient, not uniformly.
++.eig <- eigen(SIGMA, symmetric = TRUE)
++G_PC <- .eig$vectors[, 1]
++G_PC <- G_PC * sign(sum(G_PC))      # sign convention: mostly positive loadings
++
++## @KEY the broken structure: half of the real off-diagonal correlations
++## shrunk to 10 % of their value, then repaired to the nearest valid
++## correlation matrix (eigenvalue flooring). Fixed once per run, so every
++## simulated site deviates from the SAME intact structure.
++.s9_near_cor <- function(M, eps = 1e-4) {
++  M <- (M + t(M)) / 2
++  e <- eigen(M, symmetric = TRUE)
++  w <- pmax(e$values, eps)
++  M2 <- e$vectors %*% (t(e$vectors) * w)   # E diag(w) E'
++  d <- sqrt(diag(M2))
++  M2 <- M2 / outer(d, d)
++  (M2 + t(M2)) / 2
++}
++sel <- matrix(FALSE, p, p)
++sel[upper.tri(sel)] <- sample(c(TRUE, FALSE), p * (p - 1) / 2,
++                              replace = TRUE, prob = c(S9_BROKEN_FRAC, 1 - S9_BROKEN_FRAC))
++sel <- sel | t(sel)
++SIGMA_B <- SIGMA
++SIGMA_B[sel] <- SIGMA_B[sel] * 0.1
++SIGMA_B <- .s9_near_cor(SIGMA_B)
++
++## matrix square roots (eigen factors) for fast draws:
++## x = sqrt(1-k) * L %*% z1 + sqrt(k) * LB %*% z2 has exactly
++## cov = (1-k) * Sigma + k * Sigma_broken -- no per-site eigendecomposition.
++.s9_factor <- function(Sigma, sdv) {
++  C <- diag(sdv) %*% Sigma %*% diag(sdv)
++  e <- eigen(C, symmetric = TRUE)
++  e$vectors %*% diag(sqrt(pmax(e$values, 0)))
++}
++L_INTACT <- .s9_factor(SIGMA, SDV)
++L_BROKEN <- .s9_factor(SIGMA_B, SDV)
++
++## skeleton the strength is summed over: the REAL fitted Elbe glasso skeleton
++## when cached (the pipeline's actual edge set), else a top-|r| fallback at
++## 5 % density. Fixed across all sims -- it plays the role of the basin
++## aggregate skeleton in S6/S7.
++fit_elbe <- load_fitted("conc", "Basin_Elbe")
++if (!is.null(fit_elbe) && all(colnames(Xcal) %in% rownames(fit_elbe$A_glasso))) {
++  SKEL <- fit_elbe$A_glasso[colnames(Xcal), colnames(Xcal)] != 0
++  skel_src <- "cached Elbe glasso fit"
++} else {
++  thr <- quantile(abs(SIGMA[upper.tri(SIGMA)]), 0.95)
++  SKEL <- abs(SIGMA) > thr; diag(SKEL) <- FALSE
++  skel_src <- "top-5% |r| fallback (no cached fit)"
++}
++SKEL_NUM <- SKEL * 1
++dimnames(SKEL_NUM) <- dimnames(SIGMA)
++message(sprintf("[S9] calibrated on Elbe: %d sites x %d compounds, skeleton %d edges (%s)",
++                nrow(Xcal), p, sum(SKEL) / 2, skel_src))
++```
++
++
++## The simulators
++
++```{r s9-simulators}
++## ---- chemistry -------------------------------------------------------------
++## n sites: stress resampled from the real TU pool; kappa linked to stress on
++## the logit scale plus noise; latent log-concentrations drawn from the
++## kappa-mixture of the intact and broken structures; then the real MDL
++## censoring + MDL/2 floor + log10 (exactly prep_unit's damage).
++s9_sim_chemistry <- function(n) {
++  s  <- sample(TU_POOL, n, replace = TRUE)
++  zs <- as.numeric(scale(log10(s)))
++  kappa <- plogis(S9_BETA_KAPPA * zs + rnorm(n, 0, S9_KAPPA_NOISE))
++
++  Z1 <- matrix(rnorm(n * p), n, p) %*% t(L_INTACT)
++  Z2 <- matrix(rnorm(n * p), n, p) %*% t(L_BROKEN)
++  X  <- Z1 * sqrt(1 - kappa) + Z2 * sqrt(kappa)      # kappa recycles per row
++  X  <- sweep(X, 2, MU, `+`)
++  X  <- X + S9_ALPHA_MEAN * (zs %o% G_PC)            # mean shift along PC1
++
++  C <- 10^X
++  below <- C < matrix(MDLV, n, p, byrow = TRUE)
++  C[below] <- matrix(FLOOR, n, p, byrow = TRUE)[below]
++  Xf <- log10(C)
++  colnames(Xf) <- colnames(Xcal)
++  rownames(Xf) <- paste0("sim_", seq_len(n))
++  list(X = Xf, kappa = kappa, tu = s)
++}
++
++## ---- microbiome --------------------------------------------------------------
++## Dirichlet-multinomial counts; 20 % sensitive / 10 % tolerant / 70 % neutral
++## taxa; expected abundances shift with z(sum-TU) (amount channel, beta1) and
++## z(kappa) (structure channel, beta2). Metric = relative abundance of the
++## sensitive class (a SPEAR-like index).
++s9_sim_microbiome <- function(kappa, tu, beta1, beta2) {
++  n  <- length(kappa)
++  zt <- as.numeric(scale(log10(tu)))
++  zk <- as.numeric(scale(kappa))
++  n_sens <- round(0.2 * S9_NTAXA); n_tol <- round(0.1 * S9_NTAXA)
++  sens <- c(rep(-1, n_sens), rep(1, n_tol), rep(0, S9_NTAXA - n_sens - n_tol))
++  base <- rlnorm(S9_NTAXA, 0, 1.2)
++
++  eta <- outer(zt, beta1 * sens) + outer(zk, beta2 * sens)
++  eta <- sweep(eta, 2, log(base), `+`)
++  alpha <- exp(eta) * S9_DM_PHI
++
++  Gm <- matrix(rgamma(n * S9_NTAXA, shape = as.vector(alpha), rate = 1), n, S9_NTAXA)
++  P  <- Gm / rowSums(Gm)
++  counts <- t(vapply(seq_len(n), function(q) rmultinom(1, S9_DEPTH, P[q, ]),
++                     numeric(S9_NTAXA)))
++  metric <- rowSums(counts[, sens == -1, drop = FALSE]) / S9_DEPTH
++  list(counts = counts, metric = metric)
++}
++
++## ---- recovery: run the unmodified S6 estimators on fake chemistry ------------
++## rank-based AUC (Mann-Whitney), no extra packages
++.s9_auc <- function(score, truth01) {
++  r <- rank(score); m <- sum(truth01 == 1L); nn <- sum(truth01 == 0L)
++  (sum(r[truth01 == 1L]) - m * (m + 1) / 2) / (m * nn)
++}
++
++s9_recovery <- function(X, kappa) {
++  atyp <- as.integer(kappa > quantile(kappa, 0.75))   # top quartile = truly atypical
++  bo <- bonobo_cor(X, progress = FALSE, compute_sparse = FALSE)
++  li <- lioness_cor(X, progress = FALSE)
++  sb <- single_site_summary(bo$nets, A_agg = SKEL_NUM)$strength_skeleton
++  sl <- single_site_summary(li$nets, A_agg = SKEL_NUM)$strength_skeleton
++  out <- data.frame(
++    rho_bonobo   = cor(sb, kappa, method = "spearman"),
++    rho_lioness  = cor(sl, kappa, method = "spearman"),
++    auc_bonobo   = .s9_auc(-sb, atyp),     # LOW strength should flag atypical
++    auc_lioness  = .s9_auc(-sl, atyp))
++  if (S9_DO_GLASSO && !is.null(fit_elbe)) {
++    lg <- lioness_glasso(X, lambda = fit_elbe$lambda_glasso, progress = FALSE)
++    sg <- single_site_summary(lg$nets, A_agg = SKEL_NUM)$strength_skeleton
++    out$rho_glasso <- cor(sg, kappa, method = "spearman")
++    out$auc_glasso <- .s9_auc(-sg, atyp)
++  }
++  out
++}
++
++## ---- the S7 biomarker test, replayed on simulated data -----------------------
++s9_biomarker <- function(metric, tu, strength) {
++  d <- data.frame(metric = metric,
++                  zt = as.numeric(scale(log10(tu))),
++                  zs = as.numeric(scale(strength)))
++  anova(lm(metric ~ zt, data = d), lm(metric ~ zt + zs, data = d))$`Pr(>F)`[2]
++}
++
++## one simulated study: chemistry -> BONOBO strength -> microbiome -> F-test
++s9_one_study <- function(n, beta1, beta2) {
++  sim <- s9_sim_chemistry(n)
++  bo  <- bonobo_cor(sim$X, progress = FALSE, compute_sparse = FALSE)
++  sb  <- single_site_summary(bo$nets, A_agg = SKEL_NUM)$strength_skeleton
++  mb  <- s9_sim_microbiome(sim$kappa, sim$tu, beta1 = beta1, beta2 = beta2)
++  s9_biomarker(mb$metric, sim$tu, sb)
++}
++```
++
++
++## Recovery: do the estimators find the truly decoupled sites?
++
++```{r s9-recovery}
++## one example study at n = 200 for the scatter, then the n-grid for AUC/rho.
++set.seed(S9_SEED + 1L)
++ex  <- s9_sim_chemistry(200L)
++ex_bo <- bonobo_cor(ex$X, progress = FALSE, compute_sparse = FALSE)
++ex_li <- lioness_cor(ex$X, progress = FALSE)
++ex_sb <- single_site_summary(ex_bo$nets, A_agg = SKEL_NUM)$strength_skeleton
++ex_sl <- single_site_summary(ex_li$nets, A_agg = SKEL_NUM)$strength_skeleton
++
++rec_rows <- list()
++for (n in S9_GRID_N) {
++  for (rep in seq_len(S9_NREP)) {
++    set.seed(S9_SEED + 100L * n + rep)
++    sim <- s9_sim_chemistry(n)
++    rec_rows[[length(rec_rows) + 1]] <- cbind(n = n, rep = rep, s9_recovery(sim$X, sim$kappa))
++  }
++  message(sprintf("[S9] recovery grid: n = %d done", n))
++}
++recovery <- do.call(rbind, rec_rows)
++write.csv(recovery, file.path(outroot, "tableS9_recovery.csv"), row.names = FALSE)
++
++rec_summ <- aggregate(. ~ n, data = recovery[, c("n", "rho_bonobo", "rho_lioness",
++                                                 "auc_bonobo", "auc_lioness")], mean)
++print(rec_summ, row.names = FALSE)
++```
++
++
++## The power grid: biomarker F-test over n x beta2 (H_structure column: beta1 = 0)
++
++```{r s9-power}
++grid <- expand.grid(n = S9_GRID_N, beta2 = S9_GRID_BETA2)
++pw_rows <- list()
++for (i in seq_len(nrow(grid))) {
++  n <- grid$n[i]; b2 <- grid$beta2[i]
++  pv <- vapply(seq_len(S9_NREP), function(rep) {
++    set.seed(S9_SEED + 100000L * i + rep)
++    s9_one_study(n, beta1 = 0, beta2 = b2)
++  }, numeric(1))
++  pw_rows[[i]] <- data.frame(n = n, beta2 = b2, power = mean(pv < 0.05),
++                             median_p = median(pv))
++  message(sprintf("[S9] power grid: n = %d, beta2 = %.1f -> power %.2f", n, b2, mean(pv < 0.05)))
++}
++power_tab <- do.call(rbind, pw_rows)
++write.csv(power_tab, file.path(outroot, "tableS9_power.csv"), row.names = FALSE)
++print(power_tab, row.names = FALSE)
++```
++
++
++## Control scenarios: H_amount (specificity) and H_both (added value beyond TU)
++
++```{r s9-controls}
++## H_amount: biology responds to sum-TU only. The strength term should NOT
++## survive the F-test often (specificity: rejection rate ~ 0.05).
++pv_amount <- vapply(seq_len(S9_NREP), function(rep) {
++  set.seed(S9_SEED + 900000L + rep)
++  s9_one_study(S9_CTRL_N, beta1 = S9_BETA1, beta2 = 0)
++}, numeric(1))
++
++## H_both: both channels active. The strength term SHOULD win -- this is the
++## realistic version of "strength explains biology beyond sum-TU".
++pv_both <- vapply(seq_len(S9_NREP), function(rep) {
++  set.seed(S9_SEED + 950000L + rep)
++  s9_one_study(S9_CTRL_N, beta1 = S9_BETA1, beta2 = 0.6)
++}, numeric(1))
++
++controls <- data.frame(
++  scenario      = c("H0 (beta2 = 0 in grid above)", "H_amount (beta1 = 0.8 only)",
++                    "H_both (beta1 = 0.8, beta2 = 0.6)"),
++  rejection_rate = c(power_tab$power[power_tab$n == S9_CTRL_N & power_tab$beta2 == 0],
++                     mean(pv_amount < 0.05), mean(pv_both < 0.05)))
++write.csv(controls, file.path(outroot, "tableS9_controls.csv"), row.names = FALSE)
++print(controls, row.names = FALSE)
++```
++
++
++## Figures
++
++```{r s9-figures}
++png(file.path(outroot, "figS9_recovery.png"), width = 13, height = 6.5,
++    units = "in", res = 150)
++par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
++
++## (a) one example study: strength vs TRUE kappa, both estimators
++plot(ex$kappa, ex_sb, pch = 16, cex = 0.7, col = "#2A9D8F",
++     xlab = expression("true decoupling " * kappa[q]),
++     ylab = "strength on skeleton", main = "(a) recovery, one study (n = 200)")
++.rs <- function(v, to) to[1] + (v - min(v)) / (max(v) - min(v)) * diff(to)
++points(ex$kappa, .rs(ex_sl, range(ex_sb)), pch = 16, cex = 0.7, col = "#E63946")
++legend("topright", bty = "n", pch = 16, col = c("#2A9D8F", "#E63946"),
++       legend = c(sprintf("BONOBO  rho = %.2f", cor(ex_sb, ex$kappa, method = "spearman")),
++                  sprintf("LIONESS rho = %.2f", cor(ex_sl, ex$kappa, method = "spearman"))))
++
++## (b) AUC against the true atypical labels, per estimator per n
++plot(NA, xlim = range(S9_GRID_N), ylim = c(0.5, 1), xlab = "sites per study (n)",
++     ylab = "AUC (top-quartile kappa)", main = "(b) atypical-site detection", log = "x")
++for (m in c("auc_bonobo", "auc_lioness")) {
++  mm <- aggregate(recovery[[m]], by = list(n = recovery$n), mean)
++  se <- aggregate(recovery[[m]], by = list(n = recovery$n),
++                  function(v) sd(v) / sqrt(length(v)))
++  lines(mm$n, mm$x, col = if (m == "auc_bonobo") "#2A9D8F" else "#E63946", lwd = 2)
++  points(mm$n, mm$x, pch = 16, col = if (m == "auc_bonobo") "#2A9D8F" else "#E63946")
++  segments(mm$n, mm$x - se$x, mm$n, mm$x + se$x,
++           col = if (m == "auc_bonobo") "#2A9D8F" else "#E63946")
++}
++abline(h = 0.5, lty = 3, col = "grey60")
++legend("bottomright", bty = "n", lwd = 2, col = c("#2A9D8F", "#E63946"),
++       legend = c("BONOBO", "LIONESS"))
++dev.off()
++
++png(file.path(outroot, "figS9_power.png"), width = 8, height = 6.5,
++    units = "in", res = 150)
++par(mar = c(4.5, 4.5, 3, 1))
++cols <- colorRampPalette(c("#E9C46A", "#BC6C25"))(length(S9_GRID_BETA2))
++plot(NA, xlim = range(S9_GRID_N), ylim = c(0, 1), xlab = "sites per study (n)",
++     ylab = "power (F-test p < 0.05)", log = "x",
++     main = "detection power for a structure-driven biological response")
++for (j in seq_along(S9_GRID_BETA2)) {
++  sub <- power_tab[power_tab$beta2 == S9_GRID_BETA2[j], ]
++  lines(sub$n, sub$power, col = cols[j], lwd = 2,
++        lty = if (S9_GRID_BETA2[j] == 0) 3 else 1)
++  points(sub$n, sub$power, pch = 16, col = cols[j])
++}
++abline(h = c(0.05, 0.8), lty = 3, col = "grey60")
++legend("bottomright", bty = "n", lwd = 2, col = cols,
++       legend = paste0("beta2 = ", S9_GRID_BETA2), title = "structure effect")
++dev.off()
++
++message("[S9] figures written: figS9_recovery.png, figS9_power.png")
++```
++
++
++## How to read the output
++
++* **Recovery table** (`tableS9_recovery.csv`, `figS9_recovery.png`): if the
++  S7/S8 interpretation is right, BONOBO strength should correlate NEGATIVELY
++  with the true kappa (rho clearly below 0) and flag the truly-decoupled sites
++  (AUC well above 0.5), while LIONESS — which conflates amount with pattern —
++  should do visibly worse, because in this simulation amount (the PC1 mean
++  shift) and decoupling both grow with stress.
++* **Power table** (`tableS9_power.csv`, `figS9_power.png`): the beta2 = 0 row
++  is the H0 false-positive rate and should sit near 0.05. Read the table as:
++  "a same-site chemical + eDNA study with n = X sites detects a structure
++  effect of size beta2 = Y with the tabulated power." The n where the
++  beta2 = 0.6 line crosses 0.8 is the recommended minimum size of the
++  follow-up study.
++* **Controls** (`tableS9_controls.csv`): H_amount must stay near 0.05 —
++  otherwise the biomarker test is not specific and the S7 null result would
++  need reinterpretation. H_both shows the test does detect added value of
++  strength when both channels are real.
++* **Caveats** (state them in the thesis): this is an identifiability study.
++  The Dirichlet-multinomial community is a stand-in for real eDNA data;
++  kappa's link to stress is assumed, not measured; and the simulation cannot
++  say whether structure-driven biology EXISTS — only that the pipeline would
++  find it at the tabulated sample sizes if it did.
++
++
++# Session info
++
++```{r session-info}
++sessionInfo()
++```
+diff --git a/run_all.R b/run_all.R
+index 4411712..02595a5 100644
+--- a/run_all.R
++++ b/run_all.R
+@@ -32,6 +32,7 @@ STEPS <- c(
+   S6        = FALSE,  # single-sample networks (LIONESS/BONOBO per-site nets)
+   S7        = FALSE,  # site-level tests (pooled inference, UDF proxy, nulls; needs S6 output)
+   S8        = FALSE,  # backbone sensitivity (needs S6 run with LIONESS_GLASSO <- TRUE)
++  S9        = FALSE,  # paired chemical+microbial simulation, known ground truth (slow: power grid)
+   utils     = FALSE   # 99_utils.R      figure refresh + HTML report builder
+ )
+ 
+@@ -61,6 +62,7 @@ FILES <- list(
+   S6        = file.path(AN_DIR, "S6_single_networks.Rmd"),
+   S7        = file.path(AN_DIR, "S7_site_level_tests.Rmd"),
+   S8        = file.path(AN_DIR, "S8_backbone_sensitivity.Rmd"),
++  S9        = file.path(AN_DIR, "S9_simulation.Rmd"),
+   utils     = file.path(R_DIR,  "99_utils.R")
+ )
+ 
+-- 
+2.39.5
+
+
+From ba876ce2766377187ef2f300dbedd518d3648e19 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Fri, 18 Sep 2026 03:57:34 +0800
+Subject: [PATCH 7/7] Verification fixes from first real R execution (R 4.5.1)
+
+Three bugs found by running the code end-to-end on the real data:
+- S9: 11 Elbe sites have no TU column -> NA in the resampled stress pool
+  (NAs are not allowed in subscripted assignments). TU_POOL now drops NAs.
+- S7/S8: replicate() simplifies to a vector when only one unit is
+  analysed; force the null_rhos matrix shape (no-op for full 17-unit runs).
+- S7: forest plot hardcoded seq_len(17); now seq_along(units17) so subset
+  runs (missing caches) do not crash the figure.
+
+Full verification protocol and results: see final_commit/VERIFICATION.md
+---
+ analysis/S7_site_level_tests.Rmd     | 11 ++++++++---
+ analysis/S8_backbone_sensitivity.Rmd |  3 +++
+ analysis/S9_simulation.Rmd           |  5 +++++
+ 3 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/analysis/S7_site_level_tests.Rmd b/analysis/S7_site_level_tests.Rmd
+index c593685..2d8c1fe 100644
+--- a/analysis/S7_site_level_tests.Rmd
++++ b/analysis/S7_site_level_tests.Rmd
+@@ -151,6 +151,11 @@ obs_rho <- mapply(fast_rho, ranks_y, x_vals)
+ 
+ null_rhos <- replicate(S7_NPERM,
+   mapply(function(ry, x) fast_rho(ry, sample(x)), ranks_y, x_vals))  # 17 x NPERM
++## [S7-fix 17.09.2026] replicate() simplifies to a plain vector when only ONE
++## unit is analysed (subset runs, smoke tests) -- force the 17 x NPERM matrix
++## shape explicitly. Column-major fill matches replicate(), so this is a
++## no-op for the full 17-unit table.
++null_rhos <- matrix(null_rhos, nrow = length(units17))
+ p_emp <- rowMeans(abs(null_rhos) >= abs(obs_rho))
+ 
+ stouffer <- function(rhos, n) {
+@@ -266,11 +271,11 @@ lo <- apply(null_rhos, 1, quantile, 0.025); hi <- apply(null_rhos, 1, quantile,
+ plot(NA, xlim = range(lo, hi, obs_rho), ylim = c(0.5, 17.5), yaxt = "n",
+      xlab = "Spearman rho: per-site network strength vs site sum-TU", ylab = "",
+      main = "(a) per-unit rho with permutation null envelope")
+-axis(2, at = seq_len(17), labels = units17[ord], las = 1, cex.axis = 0.75)
+-segments(lo[ord], seq_len(17), hi[ord], seq_len(17), col = "grey85", lwd = 5, lend = 1)
++axis(2, at = seq_along(units17), labels = units17[ord], las = 1, cex.axis = 0.75)
++segments(lo[ord], seq_along(units17), hi[ord], seq_along(units17), col = "grey85", lwd = 5, lend = 1)
+ abline(v = 0, col = "grey60")
+ sig <- p_emp[ord] < 0.05
+-points(obs_rho[ord], seq_len(17), pch = 21, cex = 1.3,
++points(obs_rho[ord], seq_along(units17), pch = 21, cex = 1.3,
+        bg = ifelse(sig, "#2A9D8F", adjustcolor("#2A9D8F", alpha.f = 0.35)),
+        col = ifelse(sig, "black", "grey50"))
+ legend("bottomright", bty = "n", cex = 0.8,
+diff --git a/analysis/S8_backbone_sensitivity.Rmd b/analysis/S8_backbone_sensitivity.Rmd
+index 8a8f921..1105176 100644
+--- a/analysis/S8_backbone_sensitivity.Rmd
++++ b/analysis/S8_backbone_sensitivity.Rmd
+@@ -135,6 +135,9 @@ obs_lg <- mapply(fast_rho, ranks_lg, x_vals)
+ obs_bo <- mapply(fast_rho, ranks_bo, x_vals)
+ null_rhos <- replicate(S8_NPERM,
+   mapply(function(ry, x) fast_rho(ry, sample(x)), ranks_lg, x_vals))
++## [S8-fix 17.09.2026] same single-unit guard as S7: replicate() simplifies
++## to a vector for one unit; force the matrix shape (no-op for full runs).
++null_rhos <- matrix(null_rhos, nrow = length(ranks_lg))
+ p_emp_lg <- rowMeans(abs(null_rhos) >= abs(obs_lg))
+ 
+ obs_stats  <- c(neg = sum(obs_lg < 0), med = median(obs_lg), Z = stouffer(obs_lg, ns))
+diff --git a/analysis/S9_simulation.Rmd b/analysis/S9_simulation.Rmd
+index 10b47b1..95dbf2c 100644
+--- a/analysis/S9_simulation.Rmd
++++ b/analysis/S9_simulation.Rmd
+@@ -119,6 +119,11 @@ MDLV  <- 2 * FLOOR                  # floor = MDL/2  =>  MDL = 2 * floor
+ 
+ sum_tu_all <- if (ncol(tu_mat) > 0) colSums(tu_mat) else setNames(rep(1, ncol(conc_mat)), colnames(conc_mat))
+ TU_POOL <- sum_tu_all[elbe_sites]   # real stress axis to resample from
++## [S9-fix 17.09.2026] 11 Elbe sites have no TU column (no EC10 coverage) ->
++## their sum_tu is NA; resampling must draw only from sites with a real value.
++TU_POOL <- TU_POOL[!is.na(TU_POOL)]
++message(sprintf("[S9] TU pool: %d of %d Elbe sites have a sum-TU value",
++                length(TU_POOL), length(elbe_sites)))
+ 
+ ## source direction: first PC of the real correlation matrix. The mean shift
+ ## alpha * z(stress) * g makes stressed sites more polluted ALONG the basin's
+-- 
+2.39.5
+

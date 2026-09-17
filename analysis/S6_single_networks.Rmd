@@ -1,0 +1,305 @@
+---
+title: "S6 -- Single-sample networks (LIONESS / BONOBO)"
+subtitle: "Per-site compound co-occurrence networks for every spatial unit; site-level network scores for regressions against site-level stress."
+author: "Robert Neugebauer (vRN)"
+date: "16.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r knitr-opts, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 5)
+```
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+## [S6] the single-sample estimators live in their own file (05_lioness.R) --
+## function definitions only, no side effects on source.
+source(file.path(sp, "05_lioness.R"))
+```
+
+
+# Rationale (read me first)
+
+Every network in the mainline is **one graph per spatial unit**, estimated from
+all of the unit's sites at once. That answers "how do compounds co-occur in
+this basin?" but it cannot answer the follow-up the SGH question really needs:
+"how does the co-occurrence structure differ **from site to site**?" — because
+a single aggregate network has no per-site scores to regress against per-site
+stress. Single-sample network methods close exactly that gap: they estimate
+one network **per site**, so every site gets its own edge weights, and
+site-level summaries of those weights (mean weight on the aggregate skeleton,
+skeleton strength, within-module connectivity) become a response variable at
+the same resolution as the site's toxic-unit sum.
+
+The classical estimator is **LIONESS** (Kuijjer et al. 2019, iScience 14:226).
+If `G` is a network estimated from all `N` samples and `G_-q` the same estimate
+with sample `q` left out, then — for any estimator linear in the samples — the
+network from sample `q`'s perspective is recovered by linear extrapolation:
+**e_q = N·G − (N−1)·G_-q**. The mean of the per-site networks reproduces the
+aggregate network up to the O(1/n) jackknife bias of the correlation statistic
+(exactly, for covariance), so nothing is invented; the aggregate is simply
+decomposed into per-site contributions. The price is that LIONESS networks are not valid
+correlation matrices (entries leave [−1, 1], no PSD guarantee) — the
+extrapolation amplifies leave-one-out noise by a factor of ~N. **BONOBO**
+(Saha, Fanfani et al. 2024, Genome Research, doi:10.1101/gr.279117.124) is the
+Bayesian alternative built to fix that: each site's covariance is a posterior
+mean between the leave-one-out covariance (prior) and the site's own deviation
+(likelihood), `Sigma_q = delta_q·dx_q·dx_q' + (1−delta_q)·S_-q`, which is a
+convex combination of PSD matrices — so every BONOBO network is a proper
+correlation matrix in [−1, 1], at the cost of shrinking every site toward the
+leave-one-out bulk. We compute both, side by side, on the same log-transformed,
+MDL/2-floored matrix the mainline glasso sees, and summarise each per-site
+network **on the aggregate StARS skeleton** so the scores are comparable
+across sites (same edges, same modules — the fixed-node-set idea, one level
+down). Those per-site scores are what a site-level SGH regression
+(score ~ sum-TU) needs; the per-unit figure below shows the first look.
+
+
+## Parameters
+
+```{r s6-params}
+## [S6] LIONESS_GLASSO refits the glasso once per site at the FIXED aggregate
+## StARS lambda (no per-site StARS) -- the per-site partial-correlation
+## companion to the mainline network. Off by default: it costs n glasso solves
+## per unit. The two correlation-based methods are cheap and always run.
+LIONESS_GLASSO <- FALSE
+BONOBO_ALPHA   <- 0.05                       # two-sided level for the BONOBO sparse mask
+WHICH          <- c("lioness", "bonobo")     # subset of c("lioness","bonobo","lioness_glasso")
+
+## [S6] size guards: below 5 compounds there is no network to speak of; below
+## 8 sites the leave-one-out estimates (n-1 >= 7) are too fragile to be worth
+## a per-site decomposition. The mainline uses n_sites >= 4; S6 is stricter.
+S6_MIN_COMP  <- 5L
+S6_MIN_SITES <- 8L
+```
+
+
+## Per-unit loop
+
+```{r s6-run, results='hide'}
+## [S6] for every unit: aggregate fit from the mainline cache when present
+## (fitted_<kind>_<safe>.rds -- the skeleton and modules the per-site nets are
+## read against), refit at the current parameters otherwise. One tryCatch per
+## unit, exactly as in 03_mainline.Rmd, so one broken unit cannot sink the run.
+s6_units <- c(units, basin_units, section_units)
+
+run_s6_unit <- function(kind, u) {
+  pu <- prep_unit(kind, u$site_ids)
+  if (pu$n_comp < S6_MIN_COMP || pu$n_sites < S6_MIN_SITES) {
+    message("[S6] skipping ", kind, " ", u$safe,
+            " (n_comp = ", pu$n_comp, ", n_sites = ", pu$n_sites, " -- too small)")
+    return(NULL)
+  }
+
+  fit <- tryCatch(load_fitted(kind, u$safe), error = function(e) NULL)
+  if (is.null(fit)) {
+    message("[S6] no cached fit for ", kind, " ", u$safe,
+            " -- refitting glasso at current parameters (knit 03_mainline.Rmd for the canonical cache)")
+    gl  <- fit_glasso(pu$Xlog)
+    fit <- list(A_glasso = gl$A, lambda_glasso = gl$lambda,
+                mods_glasso = greedy_modules(gl$A),
+                n_sites = pu$n_sites, n_comp = pu$n_comp)
+  }
+
+  outdir <- file.path(outroot, kind_dir(kind), u$safe)
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  ## -- the single-sample estimators -----------------------------------------
+  res <- list()
+  if ("lioness" %in% WHICH)
+    res$lioness <- lioness_cor(pu$Xlog)
+  if ("bonobo" %in% WHICH)
+    res$bonobo <- bonobo_cor(pu$Xlog, alpha = BONOBO_ALPHA)
+  ## [S6] the LIONESS_GLASSO flag alone switches this on -- WHICH selects the
+  ## correlation-based methods; the glasso variant is too expensive to be
+  ## selected silently by a vector entry.
+  if (LIONESS_GLASSO)
+    res$lioness_glasso <- lioness_glasso(pu$Xlog, lambda = fit$lambda_glasso,
+                                         A_agg = fit$A_glasso,
+                                         restrict_to_aggregate = TRUE)
+
+  ## -- cache one .rds per method next to fitted_<kind>_<safe>.rds ------------
+  for (md in names(res))
+    save_single_nets(c(res[[md]], list(kind = kind, unit = u$safe,
+                                       n_sites = pu$n_sites, n_comp = pu$n_comp)),
+                     kind, u$safe, md)
+
+  ## -- per-site summary scores (on the aggregate skeleton + modules) ---------
+  summ <- do.call(rbind, lapply(names(res), function(md) {
+    s <- single_site_summary(res[[md]]$nets, A_agg = fit$A_glasso,
+                             membership = fit$mods_glasso)
+    cbind(kind = kind, unit = u$safe, label = u$label, method = md, s,
+          stringsAsFactors = FALSE)
+  }))
+  write.csv(summ, file.path(outdir, "tableS6_single_site_summary.csv"), row.names = FALSE)
+
+  list(kind = kind, unit = u$safe, label = u$label, res = res, summary = summ,
+       fit = fit, pu = pu)
+}
+
+s6_results <- list()
+for (kind in c("conc", "tu")) {
+  for (u in s6_units) {
+    r <- tryCatch(run_s6_unit(kind, u),
+                  error = function(e) { message("[S6] error on ", kind, " ", u$safe,
+                                                ": ", conditionMessage(e)); NULL })
+    if (!is.null(r)) s6_results[[paste(kind, u$safe, sep = "_")]] <- r
+  }
+}
+message(sprintf("[S6] %d unit x data-kind combinations produced single-sample networks", length(s6_results)))
+```
+
+
+## Master summary across units
+
+```{r s6-master}
+## [S6] one row per site x method x unit: the table a site-level stress
+## regression reads. Written next to the other master_*.csv files.
+s6_master <- if (length(s6_results))
+  do.call(rbind, lapply(s6_results, `[[`, "summary")) else NULL
+
+if (!is.null(s6_master)) {
+  write.csv(s6_master, file.path(outroot, "master_single_networks.csv"), row.names = FALSE)
+  message("[S6] master table: ", file.path(outroot, "master_single_networks.csv"),
+          " (", nrow(s6_master), " rows)")
+  print(head(s6_master, 12))
+} else {
+  message("[S6] no units produced results -- nothing written.")
+}
+```
+
+
+## Per-unit figures
+
+Two panels per unit. **(a)** The distribution of per-site mean edge weights on
+the aggregate skeleton, one density per method — this shows how much the
+per-site view disperses around the aggregate (LIONESS widely, BONOBO hardly —
+that is the shrinkage, not a bug). **(b)** The site's skeleton strength (sum
+of |weight| over the StARS-selected edges) against the site's total toxic
+pressure (sum-TU over compounds), with the Spearman rho in the title — the
+site-level analogue of the S5 stress-gradient test, now with one point **per
+site** instead of one per unit.
+
+```{r s6-figures, results='hide'}
+## [S6] base graphics, as everywhere in this repo.
+method_pal <- c(lioness = "#457B9D", bonobo = "#2A9D8F", lioness_glasso = "#9B2226")
+
+for (r in s6_results) {
+  outdir <- file.path(outroot, kind_dir(r$kind), r$unit)
+  methods <- names(r$res)
+
+  ## per-site total toxic units (mixture pressure), matched by site id.
+  ## [S6] match on the $site COLUMN, not on row names: rbind() across methods
+  ## deduplicates row names (EUS_001 -> EUS_0011 in the second block), so row
+  ## names silently mismatch tu_mat for every method after the first.
+  sum_tu <- NULL
+  if (exists("tu_mat") && ncol(tu_mat) > 0) {
+    sites_tu <- intersect(r$summary$site[r$summary$method == methods[1]], colnames(tu_mat))
+    if (length(sites_tu) >= 4) sum_tu <- colSums(tu_mat[, sites_tu, drop = FALSE])
+  }
+
+  png(file.path(outdir, "figS6_single_networks.png"), width = 1500, height = 1100, res = 150)
+  par(mfrow = c(1, 2), mar = c(4.8, 4.8, 4.6, 1.2), oma = c(0, 0, 2.5, 0))
+
+  ## (a) density of per-site on-skeleton mean weights, one line per method
+  ## [S6] guard the EMPTY-SKELETON case: units whose StARS network has zero
+  ## edges (the Rhine-thirds case in the mainline) have all-NA on-skeleton
+  ## scores -- plot a note instead of dying on sd(NA).
+  dens <- lapply(methods, function(md) {
+    x <- r$summary$mean_weight_on_skeleton[r$summary$method == md]
+    x <- x[is.finite(x)]
+    if (length(x) >= 3 && stats::sd(x) > 0) density(x) else NULL
+  })
+  names(dens) <- methods
+  ok <- !vapply(dens, is.null, logical(1))
+  if (any(ok)) {
+    xr <- range(unlist(lapply(dens[ok], `[[`, "x")))
+    yr <- range(unlist(lapply(dens[ok], `[[`, "y")))
+    plot(NA, xlim = xr, ylim = yr,
+         xlab = "Per-site mean weight on the aggregate skeleton",
+         ylab = "Density over sites",
+         main = "(a) spread of per-site networks")
+    for (md in methods[ok]) lines(dens[[md]], col = method_pal[md], lwd = 2.2)
+    legend("topright", bty = "n", cex = 0.9, legend = methods[ok],
+           col = method_pal[methods[ok]], lwd = 2.2)
+  } else {
+    plot.new(); title(main = "(a) spread of per-site networks")
+    text(0.5, 0.5, "not enough sites for a density", col = "grey50")
+  }
+
+  ## (b) skeleton strength vs total TU, Spearman rho in the title.
+  ## [S6] the methods live on different strength scales (LIONESS extrapolates,
+  ## BONOBO shrinks), so for DISPLAY each method's strength is z-standardised
+  ## within the unit -- the Spearman rho in the title is scale-free and
+  ## unaffected; the raw values are in tableS6_single_site_summary.csv.
+  y_all <- r$summary$strength_skeleton
+  if (!is.null(sum_tu) && any(is.finite(y_all))) {
+    rhos <- setNames(rep(NA_real_, length(methods)), methods)
+    z_of <- function(x) { s <- stats::sd(x, na.rm = TRUE)
+                          if (is.finite(s) && s > 0) as.numeric(scale(x)) else x * 0 }
+    plot(NA, xlim = range(sum_tu),
+         ylim = range(unlist(lapply(methods, function(md)
+           z_of(r$summary$strength_skeleton[r$summary$method == md]))), na.rm = TRUE),
+         xlab = "Site total toxic units (sum-TU)",
+         ylab = "Per-site skeleton strength (z-score within method)",
+         main = "(b) network strength vs site stress")
+    for (md in methods) {
+      d  <- r$summary[r$summary$method == md, ]
+      d  <- d[d$site %in% names(sum_tu), ]
+      x  <- sum_tu[d$site]
+      points(x, z_of(d$strength_skeleton), pch = 21, bg = method_pal[md], col = "grey20", cex = 1.3)
+      if (any(is.finite(d$strength_skeleton)))
+        rhos[md] <- suppressWarnings(cor(x, d$strength_skeleton, method = "spearman"))
+    }
+    legend("topleft", bty = "n", cex = 0.9, legend = methods,
+           pch = 21, pt.bg = method_pal[methods], col = "grey20")
+    mtext(sprintf("Spearman rho: %s",
+                  paste(sprintf("%s = %.2f", methods, rhos), collapse = ", ")),
+          side = 3, line = 0.3, cex = 0.8, col = "grey25")
+  } else {
+    plot.new(); title(main = "(b) network strength vs site stress")
+    text(0.5, 0.5, if (is.null(sum_tu)) "no TU data for these sites"
+                   else "empty aggregate skeleton -- no on-skeleton scores", col = "grey50")
+  }
+
+  mtext(sprintf("%s -- %s   (per-site networks on the aggregate StARS skeleton)",
+                r$label, if (r$kind == "conc") "Concentrations" else "Toxic units"),
+        outer = TRUE, cex = 1.05, font = 2)
+  dev.off()
+}
+```
+
+
+## How to read the output
+
+Per unit and data kind, one `single_<method>_<kind>_<unit>.rds` next to the
+mainline `fitted_<kind>_<unit>.rds` (the full p x p x n array of per-site
+networks; BONOBO additionally carries the tuned `deltas` and, on request,
+p-values and the sparsified networks), one `tableS6_single_site_summary.csv`
+in the unit folder, and one `figS6_single_networks.png`. Across units,
+`master_single_networks.csv` at the output root holds every site x method
+score — that is the table to join against site-level stress (sum-TU, land use,
+position along the river) for the site-resolution SGH analysis. Remember the
+method caveat when reading the distributions: LIONESS per-site weights are
+extrapolations, not correlations — their wider spread around the aggregate is
+the price of an unbiased decomposition; BONOBO's tighter spread is shrinkage
+toward the leave-one-out bulk, the price of staying a valid correlation
+matrix. Neither spread is "the truth"; the two methods bracket it.
+
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

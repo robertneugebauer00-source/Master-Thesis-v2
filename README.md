@@ -1,150 +1,91 @@
-# Chemical-networks
+# LIONESS/BONOBO single-site networks — final commit package
 
-Chemical co-occurrence networks in European rivers, the **Stress Gradient
-Hypothesis** (SGH) was used as an entry point (methodology used on microbial community was ported to abiotic interactions):
-does modular network organisation decline along a stress gradient?
+This folder contains everything added to the `sgh-chemical-networks` pipeline
+(Master-Thesis-v2) for the single-site (per-site) network extension, laid out
+**repo-relative** so it can be copied over the repository root and committed
+as-is. It corresponds to branch `lioness-bonobo` (5 commits), also provided
+as `lioness_bonobo_branch.patch` for `git am`.
 
-Measured concentrations of ~600 compounds at sites in the Elbe, Rhine and Danube are
-turned into a sparse **partial-correlation network** per spatial unit (graphical lasso,
-StARS-selected), partitioned into modules, and tested against degree-preserving null
-models. Toxicological risk is overlaid as a second, independent node attribute.
+## What this adds
 
-MSc thesis, Robert Neugebauer. Supervisor: Pedro Inostroza - Co-Superivsor: Prof. Michael Schaub
-## Layout
-
-```
-run_all.R                          run everything, in order, with timing and a log
-_targets.R                         OPTIONAL {targets} pipeline (caching/parallelism)
-R/
-  00_setup.R                       palette, packages, paths, ALL analysis parameters
-  01_data.R                        loading, MDL/2 floor, toxic units, spatial units
-                                   (country groups, basins, sections, reaches)
-  02_functions.R                   prep / fit / metrics / modules / risk / plotting
-                                   + fitted-artefact cache, run manifest,
-                                   module-stability bootstrap, signed-edge check
-  null_models_vRN.R                the null-model hierarchy (ER, config, Chung-Lu,
-                                   generative families, and the data-level pipeline null)
-  highlights_vRN.R                 tag index: hl(), hl_jump(), hl_sections()
-  99_utils.R                       figure refresh + standalone HTML report builder
-                                   (side-effect-free on source; call main())
-analysis/
-  03_mainline.Rmd                  THE PIPELINE -- produces Tables 1-4 and Figures 1-4,
-                                   and saves fitted_<kind>_<unit>.rds per unit
-  S1_method_justification.Rmd      prevalence sweep, node-set audit, glasso vs MB, MDL/2,
-                                   unit inventory, small-unit StARS depth, signed edges
-  S2_alternative_communities.Rmd   SBM / DC-SBM, ICL-selected, no random-graph null
-  S3_crossbasin.Rmd                rarefaction to common n, module sharing, basin panel
-  S4_null_hierarchy.Rmd            all ten null families + the data-level pipeline null
-  S5_stress_gradient.Rmd           the SGH test itself: modularity along a stress index
-tests/smoke_test.R                 end-to-end test on synthetic data (no private data)
-data-raw/fetch_pangaea.R           download the PANGAEA dataset by DOI
-archive/legacy_null_test.R         superseded ER-only null, kept for reproducibility
-docs/split_map.md                  how this was split out of the monolithic script
-data/README.md                     what data is needed and where to point the code
-```
-
-## What changed on 15.09.2026 (consolidation pass)
-
-- `run_unit()` now **saves the fitted networks** (`fitted_<kind>_<unit>.rds`: adjacency
-  matrices, memberships, StARS lambdas). The figure refresh in 99_utils.R and the S2/S3
-  companions read these instead of refitting -- "figure refresh without refitting" is now
-  literally true, and S2 no longer needs the external `_fit_cache.rds` from
-  `vRN_followups.R` (a legacy fallback is kept).
-- **Single sources of truth**: the metric-row builder (`metric_row()`) lives once in
-  02_functions.R (the two old copies had already drifted); reach units are defined once
-  in 01_data.R (was: 99_utils.R *and* an external script).
-- `null_test_all()` is deprecated (it was never called); the generative null families and
-  the pipeline null are now wired into **S4** instead of sitting dormant.
-- **S5** adds the explicit SGH test: a per-unit stress index from toxic units vs
-  modularity, with n as covariate and a module-stability bootstrap.
-- Each run writes `run_manifest.json` (parameters, package versions, git commit) into the
-  output tree, so every number is traceable to its configuration.
-- 99_utils.R is side-effect-free when sourced (entry point: `main()`; run_all.R drives it).
-- Repo-root detection no longer depends on a stray `sp` variable.
-- `tests/smoke_test.R` + GitHub Actions run the core pipeline on synthetic planted-module
-  data -- no private data needed.
-
-The split rule: **mainline is whatever produces Tables 1-4 and Figures 1-4;
-supplementary is whatever defends a choice.**
-
-## Quick start
-
-```r
-Sys.setenv(SGH_PROJ = "C:/path/to/your/R")   # Data path
-setwd("path/to/sgh-chemical-networks")
-source("run_all.R")                          # Edit and set which steps run at the top 
-```
-
-Or load the foundation and work interactively:
-
-```r
-source("R/00_setup.R"); source("R/01_data.R"); source("R/02_functions.R")
-```
-
-Verify the checkout runs (synthetic data, no downloads, needs only igraph + huge):
-
-```r
-source("tests/smoke_test.R")   # "Smoke tests" for Quality control 
-```
-
-## To-Do: Reproducibility
-
-Create a lockfile -> To store Package versions after installing
-
-To-Do: run once from the repo root:
-
-```r
-install.packages("renv"); renv::init()   # writes renv.lock -- commit it
-```
-
-## Method Summary
-
-Two chemicals correlate across sites mostly because some sites are polluted and some
-are clean. A **partial** correlation asks whether they still co-vary once every other
-compound is accounted for, so the shared pollution gradient does not manufacture edges.
-With more compounds than sites the partial-correlation matrix cannot be inverted
-directly, so the **graphical lasso** estimates a regularised version and **StARS**
-picks the penalty by edge stability across site resamples. Modules are found by greedy
-modularity maximisation (fast_greedy algorhythm); an edge-level test over ~18,500 compound pairs per basin shows
-they are **emission-source** compartments, not mechanistic ones.
-
-## On the null model ~ statistical significance approximation
-
-Newman's Q already contains a configuration-model expectation (`k_i*k_j/2m`), so an
-external null ensemble must preserve degrees to test the same hypothesis the statistic
-assumes. 
-Swapped to `null_test_multi()` to report **config** and **Chung-Lu** (degree-preserving) first and
-Erdos-Renyi (non degree-preserving) last. This change has a strong impact: **8 of 17 units change verdict depending on the
-null, and 5 flip sign.** -> Use config in the main text and keep ER for average path length,
-where it is the conventional reference.
-
-Change the null in one place -- the `nulls =` argument in `analysis/03_mainline.Rmd`.
-
-## Code Structure WIP - highlight important code chunks
-
-```r
-source("R/highlights_vRN.R")
-hl()                 # index of @KEY / @NULL / @PARAM / @DECISION / @CAVEAT markers
-hl_jump("NULL", 2)   # jump straight to the null test
-```
-
-## Key parameters
-
-All in `R/00_setup.R`:
-
-| Parameter | Value | Controls |
+| Step | File | What it does |
 |---|---|---|
-| `PREV_THRESH` | 0.10 | prevalence filter -- which compounds become nodes |
-| `NODESET_SCOPE` | `global` | filter applied once over all reference sites |
-| `STARS_REPNUM` | 100 | StARS subsampling depth (measured, not guessed) |
-| `RQ_THRESH` | 0.02 | absolute-risk-driver threshold |
-| `BASIN_MIN_N` / `SECTION_MIN_N` | 20 / 30 | minimum sites per unit |
+| — | `R/05_lioness.R` | Single-sample network estimators: `lioness_cor`, `bonobo_cor` (netZooPy-calibrated), `lioness_glasso`, plus `single_site_summary` and caching helpers. |
+| S6 | `analysis/S6_single_networks.Rmd` | Builds one network per site for every unit × data kind, summarises each on the aggregate StARS skeleton, writes `master_single_networks.csv`. |
+| S7 | `analysis/S7_site_level_tests.Rmd` | Site-level stress-gradient tests: pooled inference (sign count, median ρ, Stouffer) with a within-unit permutation null; circularity-free UDF proxy; trivial-score benchmark; biomarker F-test. |
+| S8 | `analysis/S8_backbone_sensitivity.Rmd` | Backbone sensitivity: repeats the S7 tests with `lioness_glasso` (per-site glasso refits at the fixed aggregate λ) so the S7 sign pattern is checked against a different backbone. Requires one S6 knit with `LIONESS_GLASSO <- TRUE`. |
+| S9 | `analysis/S9_simulation.Rmd` | Paired chemical + microbial simulation with known ground truth, calibrated on the real Elbe unit: per-site decoupling κ (intact vs broken correlation structure, rising with stress), Dirichlet-multinomial community with amount/structure response channels, recovery of κ by the unmodified S6 estimators, the S7 biomarker F-test replayed under H0/H_amount/H_structure/H_both, and a power grid over n × β2. Designs the future same-site study. |
+| — | `tests/lioness_test.R` | 23 unit checks for the estimators (LIONESS mean identity, BONOBO PSD/bounds, netZooPy cross-check to 1e-6, skeleton restriction). |
+| — | `data-raw/Danube_TRIDENT_mapping_reconstructed.csv` | Compound→SMILES mapping reconstructed via InChIKey (needed for TU/EC10). |
+| — | `run_all.R` | Pipeline runner, now with `S6`, `S7`, `S8`, `S9` steps (all `FALSE` by default). |
 
-## Data
+## Verification
 
-Not included -- see [`data/README.md`](data/README.md).
+**Every file on this branch was executed in a real R 4.5.1 environment on the
+real data before delivery** — see `VERIFICATION.md`. Short version: test suite
+23/23 PASS (incl. live netZooPy cross-check to 1e-15), S9 full run matches the
+independent Python mirror, S6/S7/S8 full code-path runs produce all tables and
+figures, the 7-commit patch applies cleanly to a fresh clone of the base.
+Three bugs found by execution were fixed (commit `ba876ce`), and one
+pre-existing mainline fragility (StARS constant-column aborts on units with
+rare compounds) is documented there.
 
-## Licence
+## How to commit
 
-Code is MIT licensed (see `LICENSE`). The datasets are **not** covered by it and remain
-under their original terms.
+```bash
+# option A: copy files over the repo root, review, commit
+cp -r final_commit/* /path/to/Master-Thesis-v2/   # results/ optional, see below
+git add -A && git commit
+
+# option B: apply the whole branch as patches
+cd /path/to/Master-Thesis-v2 && git am < lioness_bonobo_branch.patch
+```
+
+`results/` holds the analysis outputs (tables + figures) for reference; they
+are reproducible by knitting S6–S8 and need not be committed. `results/s8`
+additionally contains the exact Python replication of the S8 run
+(`prep.py`, `s8_run.py`, `s8_stats.py`, logs) used to produce the delivered
+numbers, in case the R run and the delivered CSVs should be compared.
+
+## How to run
+
+```r
+setwd("repo root"); source("run_all.R")     # S1–S8 off by default; flip STEPS
+# S8 needs S6 knitted once with LIONESS_GLASSO <- TRUE (costs n glasso
+# solves per unit; ~17 units x ~50 sites, minutes per unit)
+```
+
+## Headline results (delivered numbers)
+
+- **S6**: 34/34 unit×kind combos produced per-site networks; BONOBO per-unit
+  Spearman ρ(strength, sum-TU) negative in 13/17 units (median −0.15).
+- **S7**: pooled Stouffer Z = −2.56 (permutation p = 0.005) for BONOBO vs
+  Z = +3.76 for LIONESS — the estimators bracket and disagree; the external
+  UDF proxy sides with BONOBO (negative in 3/3 basins, Elbe p = 0.02);
+  Elbe survives trivial-score controls (partial ρ = −0.303); biomarker test
+  NEGATIVE (strength adds nothing beyond sum-TU for UDF, p = 0.98).
+- **S8** (backbone sensitivity): the sign of the site-level coupling is
+  backbone-dependent. On the glasso backbone, lioness_glasso is strongly
+  POSITIVE (Stouffer Z = +15.5; Elbe UDF ρ = +0.39, p < 1e-4) — but its
+  per-basin partial ρ given the trivial scores collapses to ~0 or negative
+  in 4/5 basins, i.e. the glasso-backbone strength is largely a
+  detection-richness score. BONOBO recomputed on the same skeleton keeps its
+  negative sign (Z = −1.66, attenuated vs S7's −2.56 — direction robust,
+  magnitude skeleton-sensitive). Per-site agreement between the two
+  backbones is essentially zero (Spearman 0.09). Net effect on the thesis:
+  the correlation-backbone BONOBO result is the only site-level signal that
+  survives trivial-score controls; report the coupling as hypothesis-
+  generating and estimator- AND backbone-dependent. See
+  `results/s8/tableS8_vs_S7_comparison.csv` and the S8 Rmd's reading guide.
+- **S9** (simulation, validated by Python mirror in `results/s9/`): on known
+  ground truth, BONOBO strength recovers the true decoupling κ
+  (Spearman ρ = −0.47…−0.50, AUC 0.73–0.76 across n = 50–500) while LIONESS
+  points the wrong way (ρ ≈ +0.11, AUC < 0.5 — the leverage conflation
+  reproduced in silico). The S7 biomarker F-test is well calibrated
+  (H0 false-positive rate 0.0–0.1), specific (H_amount rejection 0.10) and
+  sensitive (H_both 0.80 at n = 200). Power for a structure-driven biological
+  response: 0.3 at n = 50 → 0.9 at n = 200 → 1.0 at n = 500 for β2 = 0.3;
+  ≥ 0.9 already at n = 200 for β2 ≥ 0.6. Read: a future same-site
+  chemical + eDNA study should aim for n ≳ 200 sites. Caveat: identifiability
+  study — it shows the pipeline CAN find structure-driven biology at these
+  sample sizes, not that such biology exists.
