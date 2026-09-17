@@ -1,6 +1,0 @@
-test,statistic,p_value,method
-sign count negative (lioness_glasso),1.0,1.0,permutation
-median rho (lioness_glasso),0.5678,1.0,permutation
-Stouffer Z (lioness_glasso),15.508,3.0604452623479366e-54,normal theory
-Stouffer Z (lioness_glasso),15.508,1.0,permutation
-"Stouffer Z (bonobo, same skeleton)",-1.6648,0.09594588527572914,normal theory

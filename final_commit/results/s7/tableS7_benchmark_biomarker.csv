@@ -1,7 +1,0 @@
-basin,n,raw_rho,partial_rho_given_trivial,p_partial
-Basque Country internal basins,20,-0.254,-0.093,0.6958
-Danube,127,-0.033,0.101,0.259
-Elbe,153,-0.36,-0.303,0.0001
-Rhine,63,-0.215,-0.133,0.299
-Tajo,27,-0.136,0.296,0.1337
-BIOMARKER: UDF ~ log_tu vs + strength (Danube+Elbe+Rhine),289,,,0.98
