@@ -1,0 +1,207 @@
+---
+title: "S4 — The null-model hierarchy"
+subtitle: "Every graph-level null family side by side, plus the data-level pipeline null — the code existed but never ran in-repo."
+author: "Robert Neugebauer (vRN)"
+date: "15.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+```
+
+
+# Rationale (read me first)
+
+`null_models_vRN.R` ships a full hierarchy of null hypotheses, but the mainline
+only ever calls `null_test_multi()` with config / chunglu / ER. This supplement
+runs the rest of the machinery on the three whole-basin glasso networks, so the
+choice of headline null is demonstrated rather than asserted.
+
+**The degree-preserving nulls are the headline test.** Newman's Q is defined as
+edges-within-modules minus the configuration-model expectation k_i*k_j/2m, with
+the degrees taken from the data — the statistic already carries a
+degree-preserving null inside it. Comparing that statistic against an external
+ensemble only tests the same hypothesis if the ensemble also preserves degrees,
+which is why `config` (exact degree sequence) and `chunglu` (expected degree
+sequence) are the defensible rows. The density-only nulls (`gnp`, `gnm`) fix
+nothing but n and m; `ba` and `kreg` are structural contrasts (scale-free,
+regular), and `grg` adds spatial embedding without a ring.
+
+**The lattice nulls are demonstration-only.** `ring`, `ws01` and `ws10` are
+built on a circular lattice, and a ring partitions trivially into contiguous
+arcs — they carry built-in modularity of roughly Q = 0.55–0.79 before any data
+are involved. Run against them, essentially every empirical network is called
+"not modular", which answers a question nobody asked ("is my network more
+modular than a circle?"). They are kept here, and in `plot_null_grid()`, to
+make visible that the choice of null *is* the result.
+
+**The pipeline null is a different kind of test.** Every graph-level null above
+takes the fitted network as given and asks whether its partition is surprising
+for a graph of that shape. The pipeline null instead permutes the concentration
+matrix — keeping a rank-1 latent gradient, destroying the residual
+co-structure — and re-runs the *entire* estimator (glasso + StARS + fast-greedy)
+on each replicate. It is the only null that can catch structure manufactured by
+the estimator itself. Because Q falls steeply with density and the null
+replicates return sparser graphs than the observed network, the comparison must
+be read on the **density-matched Q** row of `pipeline_null_test()`, never on
+raw Q.
+
+
+## Setup
+
+```{r s4-setup}
+## [repo 15.09.2026] S4 output folder. Everything this supplement writes lives
+## under <outroot>/null_hierarchy/, so the mainline output tree stays untouched.
+out_s4 <- file.path(outroot, "null_hierarchy")
+dir.create(out_s4, recursive = TRUE, showWarnings = FALSE)
+
+## Target units: the three whole-basin networks, concentration scale. The basins
+## are the units the thesis draws its cross-basin conclusions from, so they are
+## where the null hierarchy has to be demonstrated.
+s4_kind    <- "conc"
+s4_targets <- basin_units
+```
+
+
+## The fitted networks (cache first, refit only if absent)
+
+```{r s4-fits, results='hide'}
+## [repo 15.09.2026] cache-first, same pattern as S3: read the mainline fit back
+## from disk (fitted_<kind>_<safe>.rds, written by run_unit() in 03_mainline.Rmd)
+## and refit ONLY when the cache is absent -- e.g. when S4 is knitted before the
+## mainline has ever run. A refit is slow (StARS at rep.num = STARS_REPNUM).
+s4_fits <- list()
+for (u in s4_targets) {
+  s4_fits[[u$safe]] <- tryCatch({
+    fc <- load_fitted(s4_kind, u$safe)
+    if (!is.null(fc)) {
+      message(sprintf("[S4] %s: cached fit (E = %d)", u$safe, sum(fc$A_glasso != 0) / 2))
+      A    <- fc$A_glasso
+      memb <- fc$mods_glasso
+    } else {
+      message("[S4] ", u$safe, ": no cached fit -- refitting glasso (slow)")
+      pu   <- prep_unit(s4_kind, u$site_ids)
+      gl   <- fit_glasso(pu$Xlog, seed = 42, rep.num = STARS_REPNUM)
+      A    <- gl$A
+      memb <- greedy_modules(A)
+    }
+    ## with fewer than 3 edges there is no partition to test and most null
+    ## generators degenerate -- skip the unit rather than write NA tables
+    if (sum(A != 0) / 2 < 3) {
+      message("[S4] skipping ", u$safe, " (< 3 edges -- null families are meaningless here)")
+      NULL
+    } else {
+      list(unit = u, A = A, memb = memb)
+    }
+  }, error = function(e) { message("[S4] ", u$safe, " failed: ", conditionMessage(e)); NULL })
+}
+s4_fits <- s4_fits[!vapply(s4_fits, is.null, logical(1))]
+```
+
+
+# Graph-level nulls: the whole family, side by side
+
+For each basin, `null_family_test()` draws N = 100 realisations of every family
+in `NULL_FAMILIES` (each matched to the observed n and, as closely as the
+generator allows, to the observed edge count, with weights resampled from the
+observed weight vector), re-optimises the fast-greedy partition on each draw,
+and reports the observed Q against the null distribution (z and empirical p),
+plus two descriptors of how *unlike* the observed network each family is (null
+clustering, null isolate count). `plot_null_grid()` draws the observed network
+next to one realisation of each family on a common layout — the figure that
+makes the argument without any statistics, because the lattice nulls literally
+draw as circles.
+
+```{r s4-null-families, results='hide'}
+## [repo 15.09.2026] SLOW: 10 families x N = 100 draws per basin, each draw a
+## graph generation + fast-greedy re-optimisation. Budget a few minutes.
+family_tabs <- list()
+for (sf in s4_fits) {
+  u <- sf$unit
+  tryCatch({
+    tab <- null_family_test(sf$A, sf$memb, N = 100, seed = 42)
+    num <- c("observed", "null_mean", "null_sd", "z", "p_emp", "null_clust", "null_isolates")
+    tab[num] <- round(tab[num], 4)
+    tab <- cbind(Unit = u$label, tab)
+    write.csv(tab, file.path(out_s4, sprintf("null_family_%s.csv", u$safe)), row.names = FALSE)
+    family_tabs[[u$safe]] <- tab
+    plot_null_grid(sf$A, sf$memb, u$basin,
+                   file.path(out_s4, sprintf("fig_null_grid_%s.png", u$safe)))
+    message("[S4] null families done for ", u$safe)
+  }, error = function(e) message("[S4] null families failed for ", u$safe, ": ",
+                                 conditionMessage(e)))
+}
+```
+
+
+# The data-level (pipeline) null
+
+This is the slowest and the most informative test here. Each of R = 20
+replicates keeps the rank-1 latent gradient of the log-concentration matrix
+(the shared pollution-and-dilution level), destroys all residual co-structure
+by permutation, and refits glasso + StARS from scratch. If the estimator alone
+manufactured modular-looking graphs, the null Q distribution would sit near the
+observed Q; it does not get the chance to, because the null graphs come back
+much sparser — which is exactly why the verdict must be read from the
+density-matched row ("use this one" in the `note` column), not from raw Q.
+
+```{r s4-pipeline-null, results='hide'}
+## [repo 15.09.2026] SLOW: R = 20 full glasso+StARS refits per basin (~10 s each
+## on a 150-site unit). NOTE: the pipeline null permutes the DATA and re-runs
+## the estimator, so it needs the log-concentration matrix itself -- the cached
+## fit alone is not enough, and prep_unit() is called here regardless of whether
+## the network above came from the cache. rep.num = 20 (the pipeline_null
+## default), not STARS_REPNUM: at 100 this chunk would cost ~30 min per basin,
+## and the contrast of interest (observed vs null Q) uses one fixed setting on
+## the null side throughout.
+for (sf in s4_fits) {
+  u <- sf$unit
+  tryCatch({
+    pu <- prep_unit(s4_kind, u$site_ids)
+    pn <- pipeline_null(pu$Xlog, type = "grad", R = 20, rep.num = 20)
+    pt <- pipeline_null_test(sf$A, pn)
+    pt <- cbind(Unit = u$label, pt)
+    write.csv(pt, file.path(out_s4, sprintf("pipeline_null_%s.csv", u$safe)), row.names = FALSE)
+    print(pt)
+  }, error = function(e) message("[S4] pipeline null failed for ", u$safe, ": ",
+                                 conditionMessage(e)))
+}
+```
+
+
+# Pull everything together
+
+One combined family table across the three basins. Read the `config` and
+`chunglu` rows as the test; read the `ring` / `ws01` / `ws10` rows as the
+demonstration that a badly chosen null manufactures its own answer. Rank
+families by the gap between observed and null mean, never by z alone — z is
+inflated wherever a family's null SD happens to be small.
+
+```{r s4-summary}
+if (length(family_tabs)) {
+  family_all <- do.call(rbind, family_tabs)
+  rownames(family_all) <- NULL
+  print(family_all)
+  write.csv(family_all, file.path(out_s4, "null_family_all_units.csv"), row.names = FALSE)
+} else {
+  message("[S4] no family tables produced -- nothing to summarise.")
+}
+```
+
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

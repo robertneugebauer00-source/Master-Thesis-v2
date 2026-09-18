@@ -1,0 +1,92 @@
+---
+title: "S6 — Which lens explains the modules: source vs structure vs mode of action"
+subtitle: "Extends the A30 edge-level test to a third, structurally independent lens (ClassyFire), scored on the same networks and the same common node set."
+author: "Robert Neugebauer (vRN)"
+date: "15.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r split-source, message=FALSE}
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+source(file.path(sp, "10_lenses_vRN.R"))
+```
+
+# Rationale (read me first)
+
+`metrics_from_adj()`'s header records the A30 finding: the modules in these
+networks are **emission-source compartments** — use group overwhelming, mode of
+action adding nothing on top of it. A30 pitted two lenses against each other.
+This supplement closes the question against a **third, structurally independent
+lens** — ClassyFire chemical family — and scores every lens on the **same
+networks and the same common node set**, so "most fitting" is a fair comparison
+rather than an artefact of one lens labelling more compounds than another.
+
+Each lens is scored three ways: the weighted **attribute modularity** of the
+network when the lens is imposed as the partition (with a label-permutation
+null, `Q_z`); nominal **assortativity**; and the A30 **edge-level nested
+deviance**, generalised to report each lens's **marginal** deviance (alone) and
+**unique** drop-one deviance (what it adds over the others). The headline is
+**unique deviance**: a lens can look strong marginally only because it tracks
+source, and the joint model removes that. A **negative coefficient** means
+same-label pairs are *less* connected — significant but not a module generator.
+
+**Prerequisites.** The structure lens needs the ClassyFire cache: run the
+`{#classyfire}` chunk in `S1_method_justification.Rmd` once to write
+`outputs_vRN/classyfire_lookup.csv` (set `CF_LEVEL <- "superclass"` in
+`10_lenses_vRN.R` if class is too sparse). The MOA lens is optional — drop a
+`raw_data/compound_moa.csv` (`compound`/`inchikey` + `moa`) and it is picked up
+automatically; without it the comparison runs source-vs-structure.
+
+# Run the comparison
+
+```{r s6-run, message=TRUE}
+## Spatial-gradient units: whole basins + along-river sections + reaches (conc).
+lens_units <- c(basin_units, section_units, reach_units)
+
+lenses <- assemble_lenses()
+for (nm in names(lenses))
+  message(sprintf("[S6] %-9s labels %d/%d compounds, %d groups", nm,
+                  sum(!is.na(lenses[[nm]])), length(compounds),
+                  length(unique(stats::na.omit(lenses[[nm]])))))
+
+res <- lens_run(lens_units, kind = "conc", lenses = lenses)
+```
+
+```{r s6-verdict}
+if (!is.null(res)) {
+  print(res$verdict, row.names = FALSE)
+} else {
+  message("[S6] nothing scored — need >= 2 lenses and at least one fitted network. ",
+          "Run the ClassyFire chunk in S1 and/or add raw_data/compound_moa.csv.")
+}
+```
+
+```{r s6-figure, fig.width=11, fig.height=5}
+if (!is.null(res)) {
+  f <- lens_figure(res$master)
+  message("[S6] figure written: ", f)
+  knitr::include_graphics(f)
+}
+```
+
+# How to read this
+
+`master_lens_comparison.csv` has one row per unit × lens; `master_lens_verdict.csv`
+collapses it to the winning lens per unit. A lens fits best when it carries the
+**largest positive unique deviance** — it explains edges the others do not.
+Three checks: a large **marginal** but near-zero **unique** deviance means the
+lens only looked explanatory because it tracks source (the confound the joint
+model removes); a **negative coefficient** (hatched bar in panel A) means
+same-label pairs are less connected, so the lens is not a community generator;
+and **coverage / `n_common`** guard against over-reading a lens the data can
+barely label. If structure adds nothing over source here, the thesis sentence
+strengthens: these modules encode emission source against **two** independent
+alternatives (mechanism and chemical family), not one.

@@ -1,0 +1,548 @@
+---
+title: "Chemical co-occurrence networks -- MAINLINE"
+subtitle: "Everything that produces Tables 1-4 and Figures 1-4. Method justification, alternative community detection, cross-basin work, the null hierarchy and the SGH test live in the S1-S5 companions."
+author: "Robert Neugebauer (vRN)"
+date: "14.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r knitr-opts, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 11, fig.height = 5)
+```
+
+<!-- Change log and rationale carried over verbatim from the monolithic script. -->
+<!-- =====================================================================
+     vPI2 — WHAT CHANGED RELATIVE TO THE ORIGINAL SCRIPT
+     (the original Clean_Workflow_Updated_No_CLR_vPI.Rmd is left untouched)
+
+     1. WGCNA soft-threshold floor now scales with sample size for a SIGNED
+        network (min_power_signed) instead of a fixed floor of 6.
+     2. glasso is the PRIMARY weighted network (partial correlations); MB is
+        kept only as an edge-set robustness check (ARI / Jaccard). WGCNA is
+        kept for MODULES (exposure mixtures), not for edge/density comparison.
+     3. Null model is now WEIGHTED (ER structure + resampled observed weights)
+        so observed and null modularity are on the same scale.
+     4. Prevalence filter is a single parameter (PREV_THRESH) plus a diagnostic
+        section to justify its value rather than assuming 10 %.
+     5. NEW river-basin-specific networks (all sites of a basin, n >= 20).
+     6. NEW absolute-risk-driver overlay after Inostroza et al. (2024):
+        RQ (= TU) >= 0.02 at >= 1 site. Structural centrality ("sentinel")
+        and risk-driver status are treated as two INDEPENDENT node attributes.
+     Every changed / new block below is tagged  ## [vPI2].
+
+     vPI3 — WHAT CHANGED RELATIVE TO vPI2
+     7. Non-detect substitution instead of a flat pseudocount: true zeros (MEC = 0, i.e.
+        below MDL) are replaced with a compound-specific MDL/2 (raw_data/MDL_CECs_summary.csv,
+        same lab/method pooled across projects/years, lowest reported MDL per compound;
+        matched by InChIKey, then by name), for both concentrations and the equivalent
+        MDL/2-via-EC10 for toxic units. Detected values are left exactly as measured --
+        vPI2 added its pseudocount (+1 ng/L, or 0.5*min for TU) to EVERY cell, which
+        inflated real detections and, for TU, would have distorted the absolute-risk-driver
+        threshold. Compounds without a matched MDL fall back to the vPI2 default constant.
+        Every changed block is tagged  ## [vPI3].
+     8. Whole Basin (Rhine+Danube) pooled unit removed (was conflating two unrelated
+        basins into one artificial group); Rhine and Danube are now only ever run
+        independently, either as sections (`groups`) or as whole basins (`basin_units`).
+===================================================================== -->
+
+<!-- =====================================================================
+     vRN — WHAT CHANGED RELATIVE TO vPI3 (Robert, 04.08.2026)
+     Every new/changed block is tagged  ## [vRN].
+     ADDITIONS:
+     A. Rarefied CROSS-BASIN comparison + module-sharing (the gap the report flags):
+        every basin subsampled to a common n, glasso refit R times, topology averaged,
+        and a pairwise module-sharing index (do the same compounds co-cluster across basins?).
+     B. Latitude/longitude UPPER/MIDDLE/LOWER sections incl. the ELBE
+        (Elbe & Rhine split by latitude, Danube by longitude — it flows W->E; upstream
+        end is oriented correctly per basin). Run through the same run_unit() pipeline.
+     C. Risk drivers: added a  pct_sumTU  column (share of the unit's total toxic
+        pressure), matching Pedro's "% of the calculated risk" phrasing, plus an
+        MDL/2 vs MDL vs drop-zeros SENSITIVITY check on a representative unit.
+===================================================================== -->
+
+# Rationale (read me first)
+
+## Why partial correlations, and why glasso {#rationale-partial}
+
+Two chemicals can seem to "go together" across sites for two very different
+reasons, and it matters which one we are seeing.
+
+The simplest measure is a **marginal** correlation: do the two compounds rise
+and fall together across sites, yes or no? The problem is that it does not ask
+*why*. The strongest reason two chemicals move together in a river is usually
+not a real link between them at all — it is that some sites are simply more
+polluted than others. A site just below a large city or a wastewater outfall
+has high levels of almost everything; a clean upstream site has low levels of
+almost everything; and river flow dilutes everything at once. So pick almost any
+two compounds and they will appear correlated, just because both are being
+carried up and down by this overall pollution-and-dilution level. A marginal
+correlation counts that as a connection, even though the two chemicals have
+nothing specifically to do with each other.
+
+A **partial** correlation asks the stricter question: once we account for what
+all the other measured compounds already tell us, do these two *still* move
+together? If their apparent link was only the shared pollution level (which
+every other compound also follows), that shared level already explains it,
+nothing is left over, and no edge is drawn — which is what we want. But if the
+two share something specific that the general pollution level does not explain —
+the same individual source, one compound being the breakdown product of the
+other, or both simply behaving the same way in water — then they keep moving
+together even after everything else is accounted for, and the edge survives.
+Those surviving edges are the **direct** associations worth interpreting.
+
+Computing a partial correlation means, in effect, holding all the other
+compounds constant for every pair. With many more compounds than sites this
+cannot be done the ordinary way — there is not enough data. The graphical lasso
+(**glasso**) is the tool that does it stably: it estimates all these direct
+links at once and, because the data are limited, stays conservative — forcing
+the weak, uncertain links to exactly zero and keeping only the ones strong
+enough to trust. That is why the glasso network is sparse and why its edges
+carry meaning, rather than being a dense web produced by the shared pollution
+gradient.
+
+Because our ecological interpretation rests on these direct links, we estimate the
+network from partial correlations. With more compounds than sites (p > n) the
+partial-correlation matrix cannot be obtained by ordinary matrix inversion; the
+graphical lasso (glasso) solves this by estimating a **regularised (sparse)**
+partial-correlation matrix, keeping only edges strong enough to survive
+penalisation. This is why glasso, not a plain correlation network, is our primary
+tool. Meinshausen–Bühlmann (MB) neighbourhood selection estimates the same graph
+by a different route; we keep it not as a second network but as a **robustness
+check** — the agreement between glasso and MB edges (ARI / Jaccard) tells us
+whether an edge reflects the data or one algorithm's penalty.
+
+**Prevalence filtering and glasso sparsification are orthogonal.** The two steps are
+sometimes read as pulling against each other -- one discards compounds, the other discards
+links, so why do both? They act on different objects. The prevalence filter operates on the
+**node set**: it decides which compounds are admitted as variables at all, on the grounds
+that a compound detected at a handful of sites carries too little support for any
+correlation involving it to be estimated reliably (Herren & McMahon 2017, ISME J 11:2426,
+the origin of the practice; Hernandez et al. 2021, ISME J 15:1722, the SGH application this
+pipeline follows). The glasso penalty operates on the **edge set**: given the admitted
+variables, it decides which conditional dependencies are distinguishable from zero. Neither
+substitutes for the other, and applying both is not double sparsification of the same
+quantity. The one real interaction is that the filter sets p, and p relative to n governs
+how hard the penalised problem is -- a stability and computation consideration (see the
+prevalence diagnostic and A44), not a conceptual conflict.
+
+In this dataset the filter also does a job the microbiome literature never needed it for.
+Our zeros are left-censored non-detections replaced by an MDL/2 floor, so two
+mostly-undetected compounds can correlate through shared non-detection alone. The
+prevalence filter is the control for that artefact, and the effect is measurable: with no
+filter, more than a quarter of edges rest on fewer than four joint *detections*; at the
+10 % filter, not a single edge does.
+
+## How glasso and WGCNA complement each other {#rationale-wgcna}
+
+glasso and WGCNA answer two complementary questions and are not competing versions
+of the same network. glasso is a **conditional-dependence** method: each edge is a
+direct, partial-correlation link, best suited to tracing pairwise mechanisms —
+which two compounds share a source, a metabolic pathway, or a partitioning
+behaviour. WGCNA is a **marginal, module-oriented** method: it does not remove
+shared drivers but instead groups compounds into modules of mutually co-varying
+substances. Those modules are the natural unit for an **exposure-mixture**
+interpretation — chemicals that rise and fall together across sites and therefore
+co-expose aquatic organisms. In short, glasso resolves the **wiring** between
+individual compounds (sources, direct links); WGCNA delineates the **blocks** of
+the network (co-occurring mixtures). Because the two rest on different definitions
+of association (conditional vs. soft-thresholded marginal), we do not compare their
+edge counts or densities directly — only method-agnostic outcomes: which compounds
+cluster together, and which act as hubs.
+
+## Why modularity, what a module means, and what it cannot do {#rationale-modularity}
+
+Each network is partitioned by greedy modularity maximisation (`cluster_fast_greedy`).
+Three things need saying about that choice, because the method is more often used than
+justified.
+
+**What modularity is.** Newman (2006, PNAS 103:8577) defines Q as the number of edges
+falling inside groups minus the number expected in an equivalent randomised network, and
+finds the partition by *optimising* it. It is a quality function and a data-analysis
+technique, not a hypothesis test: the paper proposes no significance procedure, and in most
+applied work none is used. The expected-edge term is k_i*k_j/2m -- a configuration-model
+expectation computed from the observed degrees -- so Q already carries a degree-preserving
+null inside it. That is why any external ensemble it is compared against must also be
+degree-preserving (see the Table 3 caption).
+
+**What a module is taken to mean.** In the microbial-network literature a module is read as
+either a group of taxa interacting more with each other than with the rest, or a group
+sharing a niche distinct from other groups (Faust & Raes 2012, Nat Rev Microbiol 10:538;
+Hernandez et al. 2021; Hou et al. 2024). The hypothesis attached is one of stability:
+modular organisation insulates groups from disturbance, so modularity is predicted to
+decline along a stress gradient. That prediction is what makes modularity the relevant
+statistic for a Stress Gradient Hypothesis test at all.
+
+**What it means here.** Neither reading transfers directly, because compounds do not
+interact and occupy no niche. An edge here is co-variation of concentration across sites
+after conditioning, so a module is a set of compounds whose concentrations move together
+across the river network -- generated by shared emission source, shared transport and
+degradation behaviour, or shared application pattern. Which of these dominates is settled
+empirically rather than assumed: an edge-level nested model over roughly 18 500 compound
+pairs per basin finds **emission source overwhelming (p from 5.0e-04 to 1.7e-60) and mode
+of action adding nothing on top of it**. Modules in this dataset are emission-source
+compartments. This is also where the SGH transfer needs stating openly: what declines with
+stress in Hernandez et al. is niche and interaction compartmentalisation, whereas what this
+pipeline measures is source compartmentalisation.
+
+**Known pathologies, and how they are handled.** Modularity maximisation has three that no
+choice of random-graph null repairs. Random graphs attain high Q by chance (Guimera et al.
+2004, Phys Rev E 70:025101). The objective cannot resolve modules smaller than about
+sqrt(2m) edges, so genuinely distinct small groups are merged -- the resolution limit
+(Fortunato & Barthelemy 2007, PNAS 104:36). And the Q landscape is degenerate, with
+exponentially many near-optimal partitions of very different composition, so a reported
+partition is one draw from a plateau rather than a unique answer (Good, de Montjoye &
+Clauset 2010, Phys Rev E 81:046106). Three responses are built into this pipeline: the null
+test uses degree-preserving ensembles rather than ER; the partition is validated against
+independently documented chemistry rather than trusted on its Q alone; and a generative
+alternative that does not use modularity at all (SBM / DC-SBM, see #sbm-blocks) is fitted
+as a check. In consequence, module-level claims here are made at the level of block
+composition -- small modules and the assignment of individual borderline compounds should
+be read with the resolution limit and the degeneracy in mind.
+
+## Concentration vs. toxic units: structure vs. risk {#rationale-tu}
+
+The network is built from measured concentrations, because co-occurrence and
+shared-source structure are properties of how much of each compound is present and
+how it co-varies across sites — questions of emission and transport, not toxicity.
+Expressing the same data as toxic units (TU = MEC / EC10) rescales each compound by
+its own potency, which is what we want for judging **risk** — but it does not change
+the network's wiring: dividing each compound by a constant is, after the
+log-transform, only a per-compound shift, and correlations are invariant to such
+shifts (empirically r ≈ 0.997 between the two correlation structures). A TU network
+is therefore not independent evidence about co-occurrence. Instead, each compound
+carries **two independent node attributes** that we are careful not to conflate.
+The first is **structural centrality** — how strongly and widely a compound is
+connected in the co-occurrence network. A highly central compound is a **sentinel**:
+its presence signals the wider mixture it travels with and it may mark a shared
+source or transport pathway, but high connectivity says nothing about how toxic or
+how concentrated it is. The second is toxicological: whether the compound is an
+**absolute risk driver**, defined after Inostroza et al. (2024) as an individual
+risk quotient RQ ≥ 0.02 at least at one site — a compound that on its own reaches an
+appreciable share of the acceptable mixture risk somewhere in the unit. Connectivity
+and risk are **orthogonal**: a compound can be a well-connected sentinel that is
+toxicologically unimportant, or a poorly connected, peripheral compound that is
+nonetheless a major risk driver at a single hotspot — the latter being exactly the
+case a co-occurrence network would overlook if read on its own. We therefore compute
+the two attributes separately and overlay the risk-driver status onto the
+concentration network, so the analysis asks **where the risk drivers actually sit**
+rather than assuming the most connected nodes are the ones that matter for the
+organism. (Note: here TU = MEC / EC10_GRO is a *simplified* RQ — single growth
+endpoint, no assessment factor — so it approximates rather than exactly reproduces
+the paper's RQ_MST; the 0.02 threshold and per-site logic follow the paper.)
+
+## Why a river-basin-specific layer, and how to read it {#rationale-basin}
+
+The country-based groups resolve chemical co-occurrence at a relatively local scale,
+where the concentrations separating one site from the next are governed mainly by
+proximity to individual inputs; there, an edge can reasonably be read as a shared
+point source or a common sub-catchment. In the river-basin-specific networks we
+deliberately change scale, pooling every site of a basin regardless of country. At
+this scale the dominant variation between sites is no longer which outfall is nearby
+but the large-scale gradients of the basin — the upstream-to-downstream progression,
+urban versus agricultural land use, flow and dilution, and season. An edge therefore
+no longer points to a single shared pipe but to a shared **basin-scale behaviour**:
+compounds that travel, persist and accumulate together along the same environmental
+and land-use gradients. We keep both scales on purpose. Associations that survive
+from the local groups up to the whole basin are robust, specific co-behaviours;
+associations that appear only at basin scale are more likely driven by the common
+upstream–downstream / dilution gradient. Because glasso conditions each compound pair
+on all other compounds, it partially removes that shared gradient and is our
+preferred estimator at this scale; the marginal (WGCNA) view will, by contrast, be
+more strongly shaped by the basin gradient itself.
+
+
+# Setup, data and functions
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+```
+
+
+## Writing summary tables etc.
+
+```{r summary-chunk}
+
+run_unit <- function(kind, unit, rep.num = STARS_REPNUM, n_null = 200, scale_tag = "group") {
+  kind_label <- if (kind == "conc") "Concentrations (ng/L)" else "Toxic units (TRIDENT EC10)"
+  outdir <- file.path(outroot, if (kind == "conc") "concentration" else "toxic_unit", unit$safe)
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  pu <- prep_unit(kind, unit$site_ids)
+  if (pu$n_comp < 5 || pu$n_sites < 4) { message("skipping ", unit$label, " (too small)"); return(NULL) }
+
+  gl <- fit_glasso(pu$Xlog, rep.num = rep.num)
+  mb <- fit_mb(pu$Xlog,     rep.num = rep.num)
+  wg <- fit_wgcna(pu$Xlog)
+
+  mods_gl <- greedy_modules(gl$A)
+  mods_mb <- greedy_modules(mb$A)
+
+  .pn  <- if (exists("KEEP_GLOBAL")) length(KEEP_GLOBAL[[kind]]) else NA_integer_
+  m_gl <- metrics_from_adj(gl$A, mods_gl,   pool_n = .pn)
+  m_mb <- metrics_from_adj(mb$A, mods_mb,   pool_n = .pn)
+  m_wg <- metrics_from_adj(wg$A, wg$modules, pool_n = .pn)
+
+  ## [repo 15.09.2026] the metric-row builder now lives in 02_functions.R as
+  ## metric_row() -- it used to be defined here AND in 99_utils.R, and the two
+  ## copies had drifted. The full documentation of each column moved with it.
+  metrics <- list(Glasso = metric_row(m_gl), MB = metric_row(m_mb), WGCNA = metric_row(m_wg))
+
+  # --- Table 1: Topology ---
+  topo <- data.frame(Metric = names(metrics$Glasso),
+                     Glasso_primary = metrics$Glasso, MB_crosscheck = metrics$MB,
+                     WGCNA_modules = metrics$WGCNA, check.names = FALSE)
+  write.csv(topo, file.path(outdir, "table1_topology_summary.csv"), row.names = FALSE)
+
+  # --- Table 2: module assignment per method (+ ARI matrix) ---
+  all_comp <- colnames(pu$Xlog)
+  Mg <- align_modules(all_comp, mods_gl)
+  Mm <- align_modules(all_comp, mods_mb)
+  Mw <- align_modules(all_comp, wg$modules)
+  modtab <- data.frame(Compound = all_comp, Use_group = ug_lookup[all_comp],
+                       Glasso_module = Mg[all_comp], MB_module = Mm[all_comp],
+                       WGCNA_module = as.character(wg$modules[all_comp]), check.names = FALSE)
+  write.csv(modtab, file.path(outdir, "table2_module_assignments.csv"), row.names = FALSE)
+
+  ari_mat <- matrix(1, 3, 3, dimnames = list(c("Glasso","MB","WGCNA"), c("Glasso","MB","WGCNA")))
+  ari_mat["Glasso","MB"]    <- ari_mat["MB","Glasso"]    <- ari(Mg, Mm)
+  ari_mat["Glasso","WGCNA"] <- ari_mat["WGCNA","Glasso"] <- ari(Mg, Mw)
+  ari_mat["MB","WGCNA"]     <- ari_mat["WGCNA","MB"]      <- ari(Mm, Mw)
+  write.csv(round(ari_mat, 3), file.path(outdir, "table2b_ARI_matrix.csv"))
+
+  # --- Table 3: Null-model test per method ---
+  ## [vRN 05.09.2026] TABLE 3 CAPTION -- HOW TO READ AND REPORT IT.
+  ## Row order is deliberate: CONFIG first, CHUNGLU second, ER LAST AND SUPPLEMENTARY.
+  ## The two degree-preserving nulls are the headline test: they are the H0 that the
+  ## modularity statistic is defined against (k_i*k_j/2m, empirical degrees), so they are
+  ## the only ones that test the same hypothesis the statistic assumes. The ER rows are
+  ## retained for two reasons only -- continuity with tables reported before 31.08.2026,
+  ## and as the worked counter-example that the choice of null IS the result (8 of 17
+  ## units change verdict; 5 flip sign). In the thesis: quote config in the main text,
+  ## move the ER modularity rows to the supplementary material, and keep ER for the
+  ## average-path-length row, where it is the conventional and correct reference.
+  ## [vRN 27.08.2026] THREE nulls, not one. igraph's modularity() scores a partition
+  ## against the configuration-model expectation k_i*k_j/2m (hard-coded, degrees taken
+  ## from the data), so comparing that statistic to an Erdos-Renyi ensemble tests a
+  ## DIFFERENT H0 than the statistic itself assumes. `config` and `chunglu` are the
+  ## internally consistent nulls; `er` is kept for continuity with earlier tables.
+  ## Rank networks by `delta` (= observed - null_mean), NEVER by z: z is inflated
+  ## wherever the null SD happens to be small (see the ER path-length column).
+  ## [vRN 05.09.2026] ER PROVENANCE (meeting TODO 04.09.2026: where is the ER null used,
+  ## why, with which ensemble, is there an original reference?).
+  ##   WHERE   : only here, inside null_test_multi(nulls = c("config","chunglu","er")).
+  ##             The legacy ER-only null_test() above is no longer called anywhere. ER
+  ##             appears in no other part of the pipeline -- not in network construction,
+  ##             edge selection, TU / risk work, RNA-seq or microbial branches.
+  ##   ENSEMBLE: G(n, p) with n = vcount and p = observed edge_density; edge weights
+  ##             resampled with replacement from the observed weight vector; fast-greedy
+  ##             re-optimised on every draw; N draws -> z and empirical p.
+  ##   REFERENCE: there is NO source reference for an external null test of Q. Hernandez
+  ##             et al. (2021, ISME J 15:1722), the SGH paper this pipeline follows,
+  ##             reports Q descriptively and correlates it with the stress ranking by
+  ##             Spearman -- no null model at all. ER as a reference graph in the
+  ##             microbial-network literature (Faust & Raes 2012, Nat Rev Microbiol
+  ##             10:538) is the small-world reference for AVERAGE PATH LENGTH, which is
+  ##             the one row where it remains appropriate here. For Q it is imported
+  ##             convention, and an inconsistent one (see the note above).
+  ##   VERDICT : keep ER for continuity of pre-31.08.2026 tables and as the worked
+  ##             counter-example; config is the headline null. If Table 3 is ever cut for
+  ##             space, drop the ER rows for Modularity and keep them for path length.
+  nulltab <- do.call(rbind, lapply(c("Glasso","MB","WGCNA"), function(md) {
+    A    <- switch(md, Glasso = gl$A,     MB = mb$A,     WGCNA = wg$A)
+    memb <- switch(md, Glasso = mods_gl,  MB = mods_mb,  WGCNA = wg$modules)
+    ## @NULL  THE NULL TEST. Change the nulls= vector here --------------------------------------------
+    cbind(Model = md, null_test_multi(A, memb, N = n_null,
+                                      nulls = c("config", "chunglu", "er")))
+  }))
+  nulltab$delta <- nulltab$observed - nulltab$null_mean        ## [vRN 27.08.2026]
+  ## [vRN 31.08.2026] p_emp is an empirical p over N draws and cannot go below
+  ## 1/(N+1). At N = 200 that floor is 0.00498, so a table full of 0.005 means
+  ## "p < 0.005", not "p = 0.005". Carried as a column so the censoring is visible.
+  ## @CAVEAT  empirical p cannot go below 1/(N+1): 0.005 means p < 0.005 ------------------------------
+  nulltab$p_emp_floor <- 1 / (n_null + 1)
+  num <- c("observed","null_mean","null_sd","z","p_emp","p_emp_floor","delta")
+  nulltab[num] <- round(nulltab[num], 4)
+  write.csv(nulltab, file.path(outdir, "table3_nullmodel_sensitivity.csv"), row.names = FALSE)
+
+  ## [vPI2] --- Table 4 + Fig 4: absolute-risk-driver overlay (built on the glasso network) ---
+  rd <- risk_driver_table(unit$site_ids, gl$A)
+  write.csv(rd, file.path(outdir, "table4_risk_drivers.csv"), row.names = FALSE)
+  plot_hub_vs_risk(rd, file.path(outdir, "fig4_hub_vs_riskdriver.png"), unit$label)
+  rd_names <- rd$Compound[rd$absolute_risk_driver %in% TRUE]
+
+  # --- Figures ---
+  As    <- list(Glasso = gl$A, MB = mb$A, WGCNA = wg$A)
+  by_mod <- list(Glasso = node_cols_module(gl$A, mods_gl),
+                 MB     = node_cols_module(mb$A, mods_mb),
+                 WGCNA  = node_cols_module(wg$A, wg$modules))
+  by_ug  <- list(Glasso = node_cols_ug(gl$A), MB = node_cols_ug(mb$A), WGCNA = node_cols_ug(wg$A))
+  mods   <- list(Glasso = mods_gl, MB = mods_mb, WGCNA = wg$modules)
+
+  plot_modules(As, by_mod, mods, metrics,
+               file.path(outdir, "fig1_network_panel.png"), unit$label, kind_label, risk = rd_names)
+  plot_usegroups(As, by_ug, metrics,
+                 file.path(outdir, "fig1b_network_panel_usegroup.png"),
+                 unit$label, kind_label, ug_present_in(As), risk = rd_names)
+  plot_wgcna_diag(wg, file.path(outdir, "fig2_wgcna_diagnostics.png"), unit$label, kind_label)
+  plot_wgcna_dashboard(wg, file.path(outdir, "fig3_wgcna_dashboard.png"), unit$label, kind_label)
+
+  ## [repo 15.09.2026] persist the FITTED OBJECTS, not just tables and PNGs.
+  ## This one artefact lets 99_utils refresh figures WITHOUT refitting, lets S2
+  ## drop its dependency on the external vRN_followups.R cache, and lets S3 read
+  ## basin fits back instead of refitting them.
+  save_fitted(list(A_glasso = gl$A, A_mb = mb$A, A_wgcna = wg$A,
+                   mods_glasso = mods_gl, mods_mb = mods_mb, mods_wgcna = wg$modules,
+                   lambda_glasso = gl$lambda, lambda_mb = mb$lambda,
+                   stab_glasso = gl$stab, beta = wg$beta,
+                   kind = kind, unit = unit, n_sites = pu$n_sites, n_comp = pu$n_comp,
+                   rep.num = rep.num),
+              kind, unit$safe)
+
+  list(kind = kind, unit = unit$safe, label = unit$label, scale = scale_tag, topo = topo,
+       ari = ari_mat, null = nulltab, beta = wg$beta, metrics = metrics,
+       n_risk_drivers = sum(rd$absolute_risk_driver %in% TRUE),
+       n_comp = pu$n_comp, n_sites = pu$n_sites)
+}
+```
+
+
+This chunk takes a while (StARS subsampling + 100 weighted null graphs per network).
+
+```{r run-all-networks, results='hide'}
+summaries <- list()
+
+# country-level sections (groups)
+for (kind in c("conc", "tu")) {
+  for (u in units) {
+    res <- tryCatch(run_unit(kind, u, scale_tag = "group"),
+                    error = function(e) { message("error on ", kind, " ", u$safe, ": ", conditionMessage(e)); NULL })
+    if (!is.null(res)) summaries[[paste(kind, u$safe, sep = "_")]] <- res
+  }
+}
+
+## [vPI2] river-basin-specific layer (all sites per basin, n >= BASIN_MIN_N)
+for (kind in c("conc", "tu")) {
+  for (u in basin_units) {
+    res <- tryCatch(run_unit(kind, u, scale_tag = "basin"),
+                    error = function(e) { message("error on ", kind, " ", u$safe, ": ", conditionMessage(e)); NULL })
+    if (!is.null(res)) summaries[[paste(kind, u$safe, sep = "_")]] <- res
+  }
+}
+
+## [vRN] latitude/longitude river sections (Upper/Middle/Lower incl. Elbe)
+for (kind in c("conc", "tu")) {
+  for (u in section_units) {
+    res <- tryCatch(run_unit(kind, u, scale_tag = "section"),
+                    error = function(e) { message("error on ", kind, " ", u$safe, ": ", conditionMessage(e)); NULL })
+    if (!is.null(res)) summaries[[paste(kind, u$safe, sep = "_")]] <- res
+  }
+}
+
+saveRDS(summaries, file.path(outroot, "_all_summaries.rds"))
+```
+
+
+# Pull everything together
+
+```{r analysis-pipeline}
+
+data_label <- function(kind) if (kind == "conc") "Concentration" else "Toxic unit (TRIDENT)"
+
+topo_all <- do.call(rbind, lapply(summaries, function(s) {
+  do.call(rbind, lapply(c("Glasso","MB","WGCNA"), function(md) {
+    m <- s$metrics[[md]]
+    data.frame(Data = data_label(s$kind), Scale = s$scale, Unit = s$label, Sites = s$n_sites, Model = md,
+               Nodes = m["Nodes"], Edges = m["Edges"], Density = m["Density"],
+             Mean_clustering = m["Mean clustering (unweighted)"], Modularity_Q = m["Modularity Q"],
+               Avg_path_length = m["Avg path length"], row.names = NULL)
+  }))
+}))
+
+ari_all <- do.call(rbind, lapply(summaries, function(s)
+  data.frame(Data = data_label(s$kind), Scale = s$scale, Unit = s$label,
+             ARI_Glasso_MB = s$ari["Glasso","MB"],
+             ARI_Glasso_WGCNA = s$ari["Glasso","WGCNA"],
+             ARI_MB_WGCNA = s$ari["MB","WGCNA"], row.names = NULL)))
+
+null_all <- do.call(rbind, lapply(summaries, function(s)
+  cbind(Data = data_label(s$kind), Scale = s$scale, Unit = s$label, s$null, row.names = NULL)))
+
+## [vPI2] master risk-driver table across all units (concentration scale)
+rd_all <- do.call(rbind, lapply(summaries, function(s) {
+  if (s$kind != "conc") return(NULL)
+  f <- file.path(outroot, "concentration", s$unit, "table4_risk_drivers.csv")
+  if (!file.exists(f)) return(NULL)
+  d <- read.csv(f, check.names = FALSE)
+  d <- d[d$absolute_risk_driver %in% c(TRUE, "TRUE"), , drop = FALSE]
+  if (!nrow(d)) return(NULL)
+  cbind(Scale = s$scale, Unit = s$label, d)
+}))
+
+write.csv(topo_all, file.path(outroot, "master_topology_summary.csv"), row.names = FALSE)
+write.csv(ari_all,  file.path(outroot, "master_ARI.csv"), row.names = FALSE)
+write.csv(null_all, file.path(outroot, "master_nullmodel_sensitivity.csv"), row.names = FALSE)
+if (!is.null(rd_all)) write.csv(rd_all, file.path(outroot, "master_risk_drivers.csv"), row.names = FALSE)
+
+wb <- createWorkbook()
+head_style <- createStyle(textDecoration = "bold", fgFill = "#264653", fontColour = "white", halign = "center")
+add_sheet <- function(name, df) {
+  addWorksheet(wb, name); writeData(wb, name, df, headerStyle = head_style)
+  freezePane(wb, name, firstRow = TRUE); setColWidths(wb, name, cols = 1:ncol(df), widths = "auto")
+}
+add_sheet("Topology", topo_all); add_sheet("ARI", ari_all); add_sheet("NullModel", null_all)
+if (!is.null(rd_all)) add_sheet("RiskDrivers", rd_all)
+saveWorkbook(wb, file.path(outroot, "network_review_results.xlsx"), overwrite = TRUE)
+
+dir.create(file.path(outroot, "data_for_marvin_upload"), showWarnings = FALSE)
+write.csv(data.frame(Compound = rownames(conc_mat), Use_group = ug_lookup[rownames(conc_mat)],
+                     conc_mat, check.names = FALSE),
+          file.path(outroot, "data_for_marvin_upload", "raw_concentration_matrix_ngL.csv"), row.names = FALSE)
+write.csv(data.frame(Compound = rownames(tu_mat), Use_group = ug_lookup[rownames(tu_mat)],
+                     tu_mat, check.names = FALSE),
+          file.path(outroot, "data_for_marvin_upload", "raw_toxicunit_matrix_TRIDENT.csv"), row.names = FALSE)
+write.csv(data.frame(Compound = names(ec10_ngL), EC10_ngL = as.numeric(ec10_ngL)),
+          file.path(outroot, "data_for_marvin_upload", "TRIDENT_EC10_ngL.csv"), row.names = FALSE)
+write.csv(sites_meta, file.path(outroot, "data_for_marvin_upload", "site_metadata.csv"), row.names = FALSE)
+
+## [repo 15.09.2026] run manifest: parameters + package versions + git commit,
+## so every number in this output tree is traceable to its exact configuration.
+write_run_manifest(extra = list(
+  pipeline = "03_mainline",
+  units_run = vapply(summaries, function(s) paste(s$kind, s$unit, sep = ":"), character(1))))
+```
+
+
+# Check-In on the Data
+
+```{r sanity-check-on-the-data}
+
+topo_all %>%
+  group_by(Model) %>%
+  summarise(units = sum(!is.na(Modularity_Q)),
+            Q_over_0.3 = sum(Modularity_Q > 0.3, na.rm = TRUE),
+            median_Q = round(median(Modularity_Q, na.rm = TRUE), 2))
+
+null_all %>%
+  filter(metric == "Modularity", !is.na(z)) %>%
+  group_by(nullModel) %>%                                     ## [vRN 27.08.2026]
+  summarise(runs = n(), z_over_2 = sum(z > 2), p_under_0.05 = sum(p_emp < 0.05),
+            median_delta = round(median(delta, na.rm = TRUE), 3))
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
+

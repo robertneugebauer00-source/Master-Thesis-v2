@@ -1,0 +1,388 @@
+---
+title: "S1 -- Method justification and robustness"
+subtitle: "Why the prevalence filter is 10 %, why the node set is global, glasso vs MB, and how much the MDL/2 floor matters."
+author: "Robert Neugebauer (vRN)"
+date: "14.09.2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+This companion defends the choices made in the mainline script. Nothing here feeds Tables 1-4.
+
+```{r split-source, message=FALSE}
+## Everything below assumes the shared setup/data/functions are loaded.
+## Repo-relative: knitr sets the working directory to this .Rmd file's folder.
+sp <- file.path("..", "R")
+source(file.path(sp, "00_setup.R"))
+source(file.path(sp, "01_data.R"))
+source(file.path(sp, "02_functions.R"))
+```
+
+
+## [vPI2] Prevalence-threshold diagnostic {#prev-diagnostic}
+
+Because 58–77 % of the filtered matrix can still be tied non-detects at a 10 %
+threshold, co-*absence* (two compounds jointly below MDL at the same sites) can
+create edges that look like co-*occurrence*. This diagnostic sweeps the threshold
+and reports, per unit: how many compounds survive, how much of the matrix is still
+zero, and — most diagnostically — **edge fragility**: the fraction of candidate
+correlations that vanish when recomputed using only the sites where *both*
+compounds are detected (co-presence). A threshold where fragility stops falling is
+where co-absence artefacts are gone. Review this before fixing `PREV_THRESH`.
+
+```{r prev-diagnostic, fig.width = 10, fig.height = 4}
+
+## [vRN 03.09.2026] NOTE: this sweep is deliberately WITHIN-unit. It is the
+## evidence for the VALUE of PREV_THRESH, not for where the filter is applied.
+## With NODESET_SCOPE = "global" that value is applied once over REF_SITES and
+## the survivors become the node pool for every unit -- see the nodeset-audit
+## chunk below.
+prev_diagnostic <- function(kind, site_ids, thresholds = c(0.10, 0.20, 0.30, 0.40, 0.50)) {
+  mat   <- if (kind == "conc") conc_mat else tu_mat
+  sites <- intersect(site_ids, colnames(mat))
+  full  <- mat[, sites, drop = FALSE]
+  do.call(rbind, lapply(thresholds, function(pv) {
+    md  <- max(2L, ceiling(pv * ncol(full)))
+    sub <- full[rowSums(full > 0) >= md, , drop = FALSE]
+    if (nrow(sub) < 5) return(data.frame(prev = pv, n_comp = nrow(sub),
+                                         pct_zero = NA, frac_fragile = NA))
+    ## [vPI3] same non-detect substitution as prep_unit(): replace only true zeros with
+    ## MDL/2, leave detected values untouched, so the diagnostic reflects what the model sees
+    floor_vec <- if (kind == "conc") {
+      mdl_half_ngL[rownames(sub)]
+    } else {
+      fb <- 0.5 * min(sub[sub > 0])
+      v  <- mdl_half_tu[rownames(sub)]
+      v[is.na(v)] <- fb
+      v
+    }
+    is_zero     <- sub == 0
+    floor_mat   <- matrix(floor_vec, nrow = nrow(sub), ncol = ncol(sub))
+    sub_floored <- sub
+    sub_floored[is_zero] <- floor_mat[is_zero]
+    X    <- log10(t(sub_floored))
+    Rall <- suppressWarnings(cor(X))
+    # co-presence-only correlation for the strongest candidate pairs
+    ut  <- which(upper.tri(Rall) & abs(Rall) >= 0.3, arr.ind = TRUE)
+    frag <- NA
+    if (nrow(ut)) {
+      keep <- 0L
+      for (k in seq_len(nrow(ut))) {
+        i <- ut[k, 1]; j <- ut[k, 2]
+        both <- (sub[i, ] > 0) & (sub[j, ] > 0)
+        if (sum(both) >= 4) {
+          rr <- suppressWarnings(cor(X[both, i], X[both, j]))
+          if (!is.na(rr) && abs(rr) >= 0.3) keep <- keep + 1L
+        }
+      }
+      frag <- 1 - keep / nrow(ut)     # fraction of strong edges that do NOT survive co-presence
+    }
+    data.frame(prev = pv, n_comp = nrow(sub),
+               pct_zero = round(mean(sub == 0) * 100, 1),
+               frac_fragile = round(frag, 3))
+  }))
+}
+
+# Run on two representative units (a country group and a whole basin)
+diag_units <- list(groups[[3]], if (length(basin_units)) basin_units[[1]] else groups[[1]])
+prev_tab <- do.call(rbind, lapply(diag_units, function(u)
+  cbind(Unit = u$label, prev_diagnostic("conc", u$site_ids))))
+dir.create(outroot, recursive = TRUE, showWarnings = FALSE)
+write.csv(prev_tab, file.path(outroot, "prevalence_diagnostic.csv"), row.names = FALSE)
+print(prev_tab)
+```
+
+
+## [vRN 03.09.2026] Node-set audit {#nodeset-audit}
+
+What the fixed node set changes, unit by unit. `bar_old` is the number of
+detections a compound needed under the old within-unit filter; it moved with
+unit size, which is why `n_old` was not monotone in the nesting (a section
+could carry more compounds than the basin containing it).
+
+```{r nodeset-audit}
+audit_units   <- c(units, basin_units, section_units)   # reach units are built later (vrn-refresh-figures)
+nodeset_audit <- do.call(rbind, lapply(audit_units, function(u) {
+  do.call(rbind, lapply(c("conc", "tu"), function(kind) {
+    pu_old <- prep_unit(kind, u$site_ids, scope = "unit")
+    pu_new <- prep_unit(kind, u$site_ids, scope = "global")
+    ndet   <- rowSums(pu_new$cs > 0)
+    data.frame(unit     = u$safe,
+               kind     = kind,
+               n_sites  = pu_new$n_sites,
+               bar_old  = max(2L, ceiling(PREV_THRESH * pu_new$n_sites)),
+               n_old    = pu_old$n_comp,
+               n_new    = pu_new$n_comp,
+               added    = length(setdiff(rownames(pu_new$cs), rownames(pu_old$cs))),
+               removed  = length(setdiff(rownames(pu_old$cs), rownames(pu_new$cs))),
+               n_lowdet = sum(ndet < 5),          # global nodes with < 5 detections here
+               pct_zero = round(mean(pu_new$cs == 0) * 100, 1))
+  }))
+}))
+dir.create(outroot, recursive = TRUE, showWarnings = FALSE)
+write.csv(nodeset_audit, file.path(outroot, "nodeset_audit.csv"), row.names = FALSE)
+print(subset(nodeset_audit, kind == "conc"))
+```
+
+
+# Model comparison with netCompare() — the MB robustness check
+
+```{r netcompare, results='hide'}
+library(NetCoMi)
+
+compare_pair <- function(A1, A2) {
+  if (sum(A1 != 0) == 0 || sum(A2 != 0) == 0) return(c(ARI = NA, Jacc_eigen = NA, Jacc_hub = NA))
+  nodes <- colnames(A1); A2 <- A2[nodes, nodes]
+  net <- netConstruct(data = A1, data2 = A2, dataType = "condDependence",
+                      sparsMethod = "none", verbose = 0)
+  pr  <- netAnalyze(net, clustMethod = "cluster_fast_greedy", hubPar = "eigenvector", hubQuant = 0.9)
+  sm  <- summary(netCompare(pr, permTest = FALSE, verbose = FALSE))
+  jac <- suppressWarnings(as.numeric(sm$jaccmat[, "Jacc"])); names(jac) <- rownames(sm$jaccmat)
+  c(ARI        = as.numeric(sm$rand["ARI", "wholeNet"]),
+    Jacc_eigen = unname(jac["eigenvec. centr."]),
+    Jacc_hub   = unname(jac["hub taxa"]))
+}
+
+netcomp <- list()
+all_run_units <- c(units, basin_units, section_units)   ## [vPI2]+[vRN] include basin + river-section layers
+for (kind in c("conc", "tu")) {
+  for (u in all_run_units) {
+    pu <- prep_unit(kind, u$site_ids); if (pu$n_comp < 5) next
+    A_gl <- tryCatch(fit_glasso(pu$Xlog)$A,
+             error = function(e) matrix(0, pu$n_comp, pu$n_comp,
+                       dimnames = list(colnames(pu$Xlog), colnames(pu$Xlog))))
+    A_mb <- fit_mb(pu$Xlog)$A
+    A_wg <- fit_wgcna(pu$Xlog)$A
+    for (pair in list(c("Glasso", "MB"), c("Glasso", "WGCNA"), c("MB", "WGCNA"))) {
+      A1 <- switch(pair[1], Glasso = A_gl, MB = A_mb)
+      A2 <- switch(pair[2], MB = A_mb, WGCNA = A_wg)
+      v  <- tryCatch(compare_pair(A1, A2), error = function(e) c(ARI = NA, Jacc_eigen = NA, Jacc_hub = NA))
+      netcomp[[length(netcomp) + 1]] <- data.frame(
+        Data = if (kind == "conc") "Concentration" else "Toxic unit (TRIDENT)",
+        Unit = u$label, Pair = paste(pair, collapse = " vs "),
+        ARI_clusters      = round(v["ARI"], 3),
+        Jaccard_eigenHubs = round(v["Jacc_eigen"], 3),
+        Jaccard_hubset    = round(v["Jacc_hub"], 3), row.names = NULL)
+    }
+  }
+}
+netcomp <- do.call(rbind, netcomp)
+write.csv(netcomp, file.path(outroot, "model_comparison_netCompare.csv"), row.names = FALSE)
+```
+
+
+# [vRN] MDL/2 sensitivity — how much does the non-detect floor matter?
+
+Recomputes the primary glasso network for one representative unit under three non-detect
+schemes — `MDL/2` (the vPI3 default), the full `MDL`, and `drop-zeros` (only compounds with
+no non-detects in the unit) — and reports edges, density, modularity and the module ARI
+against the MDL/2 network. Stable numbers here mean the MDL/2 assumption is not driving the
+topology.
+
+```{r vrn-mdl-sensitivity, results='hide'}
+mdl_sensitivity <- function(unit, kind = "conc") {
+  M     <- if (kind == "conc") conc_mat else tu_mat
+  sites <- intersect(unit$site_ids, colnames(M))
+  sub0  <- M[, sites, drop = FALSE]
+  min_detect <- max(2L, ceiling(PREV_THRESH * ncol(sub0)))
+  sub0  <- sub0[rowSums(sub0 > 0) >= min_detect, , drop = FALSE]
+  if (nrow(sub0) < 5) return(NULL)
+  comps <- rownames(sub0)
+
+  floor_half <- mdl_half_ngL[comps]; floor_half[is.na(floor_half)] <- DEFAULT_PSEUDO_CONC
+  floor_full <- mdl_ngL[comps];      floor_full[is.na(floor_full)] <- 2 * DEFAULT_PSEUDO_CONC
+  build <- function(fl) {
+    is0 <- sub0 == 0; fm <- matrix(fl, nrow(sub0), ncol(sub0)); s <- sub0; s[is0] <- fm[is0]
+    fit_glasso(log10(t(s)), rep.num = 10)$A
+  }
+  As <- list(`MDL/2` = build(floor_half), `MDL_full` = build(floor_full))
+  nozero <- rowSums(sub0 == 0) == 0
+  As[["drop_zeros"]] <- if (sum(nozero) >= 5) fit_glasso(log10(t(sub0[nozero, , drop = FALSE])), rep.num = 10)$A else NULL
+
+  base <- As[["MDL/2"]]; mb <- greedy_modules(base)
+  cmp <- function(A) {
+    if (is.null(A)) return(c(edges = NA, density = NA, modularity = NA, ARI_vs_MDLhalf = NA))
+    mm <- greedy_modules(A); mt <- metrics_from_adj(A, mm)
+    common <- intersect(names(mb), names(mm))
+    c(edges = mt$edges, density = round(mt$density, 4), modularity = round(mt$modularity, 3),
+      ARI_vs_MDLhalf = round(ari(mb[common], mm[common]), 3))
+  }
+  do.call(rbind, lapply(names(As), function(nm) data.frame(scheme = nm, t(cmp(As[[nm]])), row.names = NULL)))
+}
+
+sens_unit <- if (length(basin_units)) basin_units[[1]] else units[[1]]
+mdl_sens  <- tryCatch(mdl_sensitivity(sens_unit, "conc"),
+                      error = function(e) { message("[vRN] MDL sensitivity failed: ", conditionMessage(e)); NULL })
+if (!is.null(mdl_sens)) {
+  write.csv(mdl_sens, file.path(outroot, sprintf("mdl_sensitivity_%s.csv", sens_unit$safe)), row.names = FALSE)
+  print(mdl_sens)
+}
+```
+
+
+## [vRN 05.09.2026] Optional: objective chemical families via ClassyFire {#classyfire}
+
+`ug_lookup` above carries the PANGAEA **use group** (herbicide, pharmaceutical, ...), which
+is a usage category, not a chemical one. A structural taxonomy is a genuinely independent
+axis: it lets the module interpretation be tested against chemical family as well as
+against use group and mode of action (A30), and it is assigned by an algorithm rather than
+by hand. ClassyFire (Djoumbou Feunang et al. 2016, J Cheminform 8:61) provides exactly that
+-- kingdom / superclass / class / subclass, derived from structure. `compound_inchikey`,
+read from the PANGAEA sheet just above, is the lookup key.
+
+This chunk is **`eval = FALSE` by design**: it is a network call over ~610 compounds, it is
+slow and rate-limited, and it should be run once and cached. Nothing downstream depends on
+it -- `cf_lookup` is an optional extra annotation column.
+
+```{r vrn-classyfire, eval = FALSE}
+## Batch ClassyFire classification, keyed on InChIKey, cached to disk.
+## Run once; the CSV is the artefact and the chunk stays eval = FALSE afterwards.
+## NB both endpoints below are third-party services that have changed and gone down
+## before (the Wishart server especially). Check the cache before relying on it.
+cf_cache <- file.path(outroot, "classyfire_lookup.csv")
+
+classyfire_one <- function(ik) {
+  ## preferred: the classyfireR package (CRAN), which wraps the ClassyFire REST API
+  if (requireNamespace("classyfireR", quietly = TRUE)) {
+    r <- try(classyfireR::get_classification(ik), silent = TRUE)
+    if (!inherits(r, "try-error") && !is.null(r)) {
+      cl <- try(classyfireR::classification(r), silent = TRUE)
+      if (!inherits(cl, "try-error") && is.data.frame(cl) && nrow(cl))
+        return(setNames(as.character(cl$Classification), tolower(as.character(cl$Level))))
+    }
+  }
+  ## fallback: the Fiehn lab batch mirror, which serves pre-computed entities by InChIKey
+  if (requireNamespace("jsonlite", quietly = TRUE)) {
+    u <- sprintf("https://cfb.fiehnlab.ucdavis.edu/entities/%s.json", ik)
+    j <- try(jsonlite::fromJSON(u), silent = TRUE)
+    if (!inherits(j, "try-error") && is.list(j))
+      return(c(kingdom    = j$kingdom$name,   superclass = j$superclass$name,
+               class      = j$class$name,     subclass   = j$subclass$name))
+  }
+  NULL
+}
+
+if (file.exists(cf_cache)) {
+  cf_tab <- read.csv(cf_cache, stringsAsFactors = FALSE)
+} else {
+  iks  <- unique(compound_inchikey[nzchar(compound_inchikey) & !is.na(compound_inchikey)])
+  rows <- vector("list", length(iks))
+  for (i in seq_along(iks)) {
+    x <- classyfire_one(iks[i])
+    pick <- function(nm) if (!is.null(x) && nm %in% names(x)) unname(x[[nm]]) else NA_character_
+    rows[[i]] <- data.frame(InChIKey = iks[i], kingdom = pick("kingdom"),
+                            superclass = pick("superclass"), class = pick("class"),
+                            subclass = pick("subclass"), stringsAsFactors = FALSE)
+    Sys.sleep(0.5)                       # be polite: the API is rate-limited
+    if (i %% 25 == 0) message("[classyfire] ", i, "/", length(iks))
+  }
+  cf_tab <- do.call(rbind, rows)
+  write.csv(cf_tab, cf_cache, row.names = FALSE)
+}
+
+## compound -> chemical class: the structural parallel of ug_lookup
+cf_lookup <- setNames(cf_tab$class[match(compound_inchikey, cf_tab$InChIKey)], compounds)
+message(sprintf("[classyfire] %d of %d compounds classified, %d distinct classes",
+                sum(!is.na(cf_lookup)), length(cf_lookup),
+                length(unique(stats::na.omit(cf_lookup)))))
+```
+
+
+# [repo] Automated sensitivity sweeps {#sensitivity-sweeps}
+
+Added 15.09.2026. The setup comments record two open questions that were blocked
+on manual re-runs: (i) A44 recommends `PREV_THRESH = 0.05`, but flipping the
+default first needs the unit inventory re-run at 0.05 (only Basin_Elbe had been
+tested, and the small units are where StARS collapsed in A37); (ii) the StARS
+depth sweep (STARS_REPNUM = 100) covered only the three whole basins, not the
+small section/reach units. Both are automated here so that changing a default is
+a one-line edit with the evidence attached.
+
+## Unit inventory across candidate prevalence thresholds
+
+For each candidate `PREV_THRESH`: the global node pool (what `global_nodeset()`
+admits), and per unit the number of pool compounds that survive the within-unit
+`MIN_DETECT_UNIT` guard -- i.e. how large each unit's network would actually be,
+and whether the small units stay viable (>= 5 compounds). Cheap: no fitting.
+
+```{r vrn-unit-inventory}
+unit_inventory <- function(thresholds = c(0.05, 0.10, 0.15, 0.20), kind = "conc") {
+  all_units <- c(units, basin_units, section_units, reach_units)
+  mat <- if (kind == "conc") conc_mat else tu_mat
+  do.call(rbind, lapply(thresholds, function(pv) {
+    pool <- global_nodeset(kind, prev = pv)
+    do.call(rbind, lapply(all_units, function(u) {
+      sites <- intersect(u$site_ids, colnames(mat))
+      sub   <- mat[rownames(mat) %in% pool, sites, drop = FALSE]
+      n_ok  <- sum(rowSums(sub > 0) >= MIN_DETECT_UNIT)
+      data.frame(prev = pv, unit = u$safe, n_sites = length(sites),
+                 pool_size = length(pool), n_comp_fit = n_ok,
+                 viable = n_ok >= 5, row.names = NULL)
+    }))
+  }))
+}
+
+inv <- unit_inventory()
+write.csv(inv, file.path(outroot, "unit_inventory_prevsweep.csv"), row.names = FALSE)
+print(subset(inv, !viable))          # the units a threshold change would kill
+print(subset(inv, unit == "Basin_Elbe"))
+```
+
+## StARS depth sweep for the SMALL units
+
+The `STARS_REPNUM = 100` decision rests on a basin-scale sweep; the comment in
+`00_setup.R` says the small units "were NOT in this sweep". This closes that gap
+for the two smallest section units: lambda and edge count at
+rep.num x seed. Instability shows up as lambda/edges varying within a rep.num.
+
+```{r vrn-stars-depth-small-units, results='hide'}
+stars_depth_units <- function(units_to_test, repnums = c(20, 50, 100),
+                              seeds = c(42, 7, 13), kind = "conc") {
+  do.call(rbind, lapply(units_to_test, function(u) {
+    pu <- prep_unit(kind, u$site_ids)
+    if (pu$n_comp < 5) return(NULL)
+    do.call(rbind, lapply(repnums, function(rn) {
+      do.call(rbind, lapply(seeds, function(sd) {
+        gl <- fit_glasso(pu$Xlog, seed = sd, rep.num = rn)
+        data.frame(unit = u$safe, n_sites = pu$n_sites, rep.num = rn, seed = sd,
+                   lambda = gl$lambda, edges = sum(gl$A != 0) / 2,
+                   row.names = NULL)
+      }))
+    }))
+  }))
+}
+
+small2 <- section_units[order(sapply(section_units, function(u) length(u$site_ids)))][1:2]
+stars_small <- tryCatch(stars_depth_units(small2),
+                        error = function(e) { message("[vRN] StARS depth sweep failed: ",
+                                                      conditionMessage(e)); NULL })
+if (!is.null(stars_small)) {
+  write.csv(stars_small, file.path(outroot, "stars_depth_small_units.csv"), row.names = FALSE)
+  print(stars_small)
+}
+```
+
+## Signed-edge check: does dropping the sign of partial correlations matter?
+
+`abs(A)` discards the sign of the (few) negative edges -- 55 of 9452 (0.6 %)
+when checked on 27.08.2026. `signed_edge_check()` (02_functions.R) turns "we
+checked" into a per-unit number: the negative-edge share, and the ARI between
+the module partition on |A| and on the positive-edges-only network. ARI ~ 1
+means no module claim can depend on the dropped signs. Reads the cached mainline
+fits; refits nothing.
+
+```{r vrn-signed-edge-check}
+signed_tab <- do.call(rbind, lapply(c(units, basin_units, section_units), function(u) {
+  fc <- tryCatch(load_fitted("conc", u$safe), error = function(e) NULL)
+  if (is.null(fc)) return(NULL)
+  cbind(unit = u$safe, signed_edge_check(fc$A_glasso))
+}))
+if (!is.null(signed_tab)) {
+  write.csv(signed_tab, file.path(outroot, "signed_edge_check.csv"), row.names = FALSE)
+  print(signed_tab)
+}
+```
