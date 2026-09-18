@@ -1,0 +1,76 @@
+[21:29:02] units (asc n): [('Basin_Basque_Country_internal_basins', 20), ('Basin_Tajo', 27), ('Sec_Rhine_Upper', 30), ('Sec_Rhine_Lower', 30), ('Danube_Upper', 35), ('Sec_Danube_Middle', 42), ('Sec_Danube_Lower', 42), ('Sec_Danube_Upper', 43), ('Danube_Middle', 44), ('Danube_Lower', 48), ('Rhine_Lower', 50), ('Sec_Elbe_Upper', 50), ('Sec_Elbe_Middle', 50), ('Sec_Elbe_Lower', 50), ('Basin_Rhine', 63), ('Basin_Danube', 127), ('Basin_Elbe', 153)]
+[21:30:50] Basin_Basque_Country_internal_basins: n=20 p=129 lam=0.7279 (idx 4) edges=446 mean_weight_maxdiff=1.55e-15 [108s]
+[21:32:51] Basin_Tajo: n=27 p=132 lam=0.5298 (idx 8) edges=739 mean_weight_maxdiff=1.61e-15 [121s]
+[21:34:45] Sec_Rhine_Upper: n=30 p=142 lam=0.4165 (idx 11) edges=918 mean_weight_maxdiff=1.42e-15 [114s]
+[21:38:30] Sec_Rhine_Lower: n=30 p=167 lam=0.3290 (idx 14) edges=1222 mean_weight_maxdiff=1.80e-15 [225s]
+[21:43:23] Danube_Upper: n=35 p=170 lam=0.3562 (idx 13) edges=1231 mean_weight_maxdiff=1.94e-15 [293s]
+[21:46:36] Sec_Danube_Middle: n=42 p=166 lam=0.4161 (idx 11) edges=1060 mean_weight_maxdiff=1.61e-15 [193s]
+[21:49:43] Sec_Danube_Lower: n=42 p=169 lam=0.3282 (idx 14) edges=1242 mean_weight_maxdiff=1.44e-15 [187s]
+[21:52:52] Sec_Danube_Upper: n=43 p=165 lam=0.4893 (idx 9) edges=1025 mean_weight_maxdiff=1.72e-15 [189s]
+[21:56:26] Danube_Middle: n=44 p=157 lam=0.3561 (idx 13) edges=1082 mean_weight_maxdiff=1.47e-15 [214s]
+[22:01:23] Danube_Lower: n=48 p=170 lam=0.3847 (idx 12) edges=1223 mean_weight_maxdiff=2.05e-15 [296s]
+[22:04:27] Rhine_Lower: FAILED -- ValueError('all input arrays must have the same shape')
+[22:06:43] Sec_Elbe_Upper: n=50 p=181 lam=0.3376 (idx 13) edges=1179 mean_weight_maxdiff=2.30e-15 [137s]
+[22:10:05] Sec_Elbe_Middle: n=50 p=179 lam=0.3380 (idx 13) edges=1186 mean_weight_maxdiff=2.28e-15 [201s]
+[22:17:56] Sec_Elbe_Lower: n=50 p=176 lam=0.3239 (idx 14) edges=1271 mean_weight_maxdiff=2.00e-15 [471s]
+[22:21:35] Basin_Rhine: n=63 p=176 lam=0.2588 (idx 17) edges=1261 mean_weight_maxdiff=2.16e-15 [220s]
+[22:24:41] Basin_Danube: n=127 p=182 lam=0.2105 (idx 19) edges=1573 mean_weight_maxdiff=2.00e-15 [186s]
+[22:30:50] Basin_Elbe: n=153 p=182 lam=0.2199 (idx 18) edges=1478 mean_weight_maxdiff=2.05e-15 [368s]
+[22:30:50] ALL DONE
+[22:32:05] units (asc n): [('Basin_Basque_Country_internal_basins', 20), ('Basin_Tajo', 27), ('Sec_Rhine_Upper', 30), ('Sec_Rhine_Lower', 30), ('Danube_Upper', 35), ('Sec_Danube_Middle', 42), ('Sec_Danube_Lower', 42), ('Sec_Danube_Upper', 43), ('Danube_Middle', 44), ('Danube_Lower', 48), ('Rhine_Lower', 50), ('Sec_Elbe_Upper', 50), ('Sec_Elbe_Middle', 50), ('Sec_Elbe_Lower', 50), ('Basin_Rhine', 63), ('Basin_Danube', 127), ('Basin_Elbe', 153)]
+[22:32:05] Basin_Basque_Country_internal_basins: already done, skipping
+[22:32:05] Basin_Tajo: already done, skipping
+[22:32:05] Sec_Rhine_Upper: already done, skipping
+[22:32:05] Sec_Rhine_Lower: already done, skipping
+[22:32:05] Danube_Upper: already done, skipping
+[22:32:05] Sec_Danube_Middle: already done, skipping
+[22:32:05] Sec_Danube_Lower: already done, skipping
+[22:32:05] Sec_Danube_Upper: already done, skipping
+[22:32:05] Danube_Middle: already done, skipping
+[22:32:05] Danube_Lower: already done, skipping
+[22:36:14] Rhine_Lower: FAILED -- RuntimeError('9 LOO glasso fits did not converge')
+[22:36:14] Sec_Elbe_Upper: already done, skipping
+[22:36:14] Sec_Elbe_Middle: already done, skipping
+[22:36:14] Sec_Elbe_Lower: already done, skipping
+[22:36:14] Basin_Rhine: already done, skipping
+[22:36:14] Basin_Danube: already done, skipping
+[22:36:14] Basin_Elbe: already done, skipping
+[22:36:14] ALL DONE
+[22:37:26] units (asc n): [('Basin_Basque_Country_internal_basins', 20), ('Basin_Tajo', 27), ('Sec_Rhine_Upper', 30), ('Sec_Rhine_Lower', 30), ('Danube_Upper', 35), ('Sec_Danube_Middle', 42), ('Sec_Danube_Lower', 42), ('Sec_Danube_Upper', 43), ('Danube_Middle', 44), ('Danube_Lower', 48), ('Rhine_Lower', 50), ('Sec_Elbe_Upper', 50), ('Sec_Elbe_Middle', 50), ('Sec_Elbe_Lower', 50), ('Basin_Rhine', 63), ('Basin_Danube', 127), ('Basin_Elbe', 153)]
+[22:37:26] Basin_Basque_Country_internal_basins: already done, skipping
+[22:37:26] Basin_Tajo: already done, skipping
+[22:37:26] Sec_Rhine_Upper: already done, skipping
+[22:37:26] Sec_Rhine_Lower: already done, skipping
+[22:37:26] Danube_Upper: already done, skipping
+[22:37:26] Sec_Danube_Middle: already done, skipping
+[22:37:26] Sec_Danube_Lower: already done, skipping
+[22:37:26] Sec_Danube_Upper: already done, skipping
+[22:37:26] Danube_Middle: already done, skipping
+[22:37:26] Danube_Lower: already done, skipping
+[22:42:37] Rhine_Lower: FAILED -- RuntimeError('9 LOO glasso fits did not converge')
+[22:42:37] Sec_Elbe_Upper: already done, skipping
+[22:42:37] Sec_Elbe_Middle: already done, skipping
+[22:42:37] Sec_Elbe_Lower: already done, skipping
+[22:42:37] Basin_Rhine: already done, skipping
+[22:42:37] Basin_Danube: already done, skipping
+[22:42:37] Basin_Elbe: already done, skipping
+[22:42:37] ALL DONE
+[22:52:45] units (asc n): [('Basin_Basque_Country_internal_basins', 20), ('Basin_Tajo', 27), ('Sec_Rhine_Upper', 30), ('Sec_Rhine_Lower', 30), ('Danube_Upper', 35), ('Sec_Danube_Middle', 42), ('Sec_Danube_Lower', 42), ('Sec_Danube_Upper', 43), ('Danube_Middle', 44), ('Danube_Lower', 48), ('Rhine_Lower', 50), ('Sec_Elbe_Upper', 50), ('Sec_Elbe_Middle', 50), ('Sec_Elbe_Lower', 50), ('Basin_Rhine', 63), ('Basin_Danube', 127), ('Basin_Elbe', 153)]
+[22:52:45] Basin_Basque_Country_internal_basins: already done, skipping
+[22:52:45] Basin_Tajo: already done, skipping
+[22:52:45] Sec_Rhine_Upper: already done, skipping
+[22:52:45] Sec_Rhine_Lower: already done, skipping
+[22:52:45] Danube_Upper: already done, skipping
+[22:52:45] Sec_Danube_Middle: already done, skipping
+[22:52:45] Sec_Danube_Lower: already done, skipping
+[22:52:45] Sec_Danube_Upper: already done, skipping
+[22:52:45] Danube_Middle: already done, skipping
+[22:52:45] Danube_Lower: already done, skipping
+[23:15:24] Rhine_Lower: n=50 p=174 lam=0.4174 (idx 11) edges=1087 mean_weight_maxdiff=2.55e-15 [1359s]
+[23:15:24] Sec_Elbe_Upper: already done, skipping
+[23:15:24] Sec_Elbe_Middle: already done, skipping
+[23:15:24] Sec_Elbe_Lower: already done, skipping
+[23:15:24] Basin_Rhine: already done, skipping
+[23:15:24] Basin_Danube: already done, skipping
+[23:15:24] Basin_Elbe: already done, skipping
+[23:15:24] ALL DONE
