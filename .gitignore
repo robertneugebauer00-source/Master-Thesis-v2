@@ -1,0 +1,9 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+
+# large regenerable caches (glasso fits, single-site nets, manifests)
+outputs/**/*.rds
+outputs/reports/*.log
+_targets/

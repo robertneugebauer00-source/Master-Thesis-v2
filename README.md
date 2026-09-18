@@ -89,3 +89,14 @@ setwd("repo root"); source("run_all.R")     # S1–S8 off by default; flip STEPS
   chemical + eDNA study should aim for n ≳ 200 sites. Caveat: identifiability
   study — it shows the pipeline CAN find structure-driven biology at these
   sample sizes, not that such biology exists.
+
+## Setting up on a new machine
+
+1. Install R 4.5.x and RStudio (the lockfile was made with R 4.5.3).
+2. Clone or copy this folder anywhere -- no paths need editing; the scripts locate the repo themselves.
+3. Open `sgh-chemical-networks.Rproj`. renv bootstraps itself via `.Rprofile`.
+4. Run `renv::restore()` once to install the exact package versions from `renv.lock`
+   (CRAN, Bioconductor and the GitHub packages NetCoMi, SpiecEasi, SPRING).
+5. `source("run_all.R")`. Inputs are read from `data-raw/`, results go to `outputs/`.
+
+After installing or updating a package, run `renv::snapshot()` and commit `renv.lock`.

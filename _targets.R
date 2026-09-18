@@ -44,11 +44,12 @@ tar_option_set(packages = c("igraph", "huge"))
 ## ---- track the private input file -------------------------------------------
 ## The pipeline's single irreplaceable input. format = "file" hashes it, so
 ## downstream targets refit only when the xlsx itself changes. Path logic
-## mirrors R/00_setup.R (SGH_PROJ env var, author path as fallback).
+## mirrors R/00_setup.R (SGH_PROJ env var, else <repo>/data-raw/).
 tar_target(
   data_files,
-  file.path(Sys.getenv("SGH_PROJ", unset = "C:/Users/rober/OneDrive/Masterkram/R"),
-            "scripts", "Finckh_Carmona_2023_PANGAEA_R1.xlsx"),
+  if (nzchar(Sys.getenv("SGH_PROJ")))
+    file.path(Sys.getenv("SGH_PROJ"), "scripts", "Finckh_Carmona_2023_PANGAEA_R1.xlsx")
+  else file.path("data-raw", "Finckh_Carmona_2023_PANGAEA_R1.xlsx"),
   format = "file"
 )
 

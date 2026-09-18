@@ -6,8 +6,8 @@
 ##   repo layout   R/00_setup.R ... analysis/03_mainline.Rmd
 ##   flat layout   00_setup.R ... 03_mainline.Rmd all in one folder
 ##
-## Run it with the working directory set to the repo root (or the split folder):
-##   setwd("C:/Users/rober/git/sgh-chemical-networks"); source("run_all.R")
+## No setwd() needed -- the script finds its own folder:
+##   source("path/to/repo/run_all.R")   -- from anywhere; it locates itself
 ##
 ## Nothing here changes any analysis. It only decides WHAT runs and in WHICH order,
 ## times each step, and writes a log so a failed run says where it stopped.
@@ -42,9 +42,33 @@ MODE          <- "render"
 STOP_ON_ERROR <- TRUE      # FALSE = carry on and report which steps failed
 
 ## ---- 2. locate everything --------------------------------------------------
+## [repo 18.09.2026] run from anywhere: find the folder THIS file is in and work
+## from there, so it does not matter what the working directory was, which machine
+## this is, or where the repo was cloned. Tries source(), Rscript --file=, and the
+## RStudio editor, in that order; falls back to the current working directory.
+ROOT <- local({
+  here <- NULL
+  for (i in rev(seq_len(sys.nframe()))) {
+    of <- sys.frame(i)$ofile
+    if (!is.null(of) && basename(of) == "run_all.R") { here <- of; break }
+  }
+  if (is.null(here)) {
+    fa <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))
+    if (length(fa) && basename(fa[1]) == "run_all.R") here <- fa[1]
+  }
+  if (is.null(here) && requireNamespace("rstudioapi", quietly = TRUE) &&
+      isTRUE(tryCatch(rstudioapi::isAvailable(), error = function(e) FALSE))) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p) && basename(p) == "run_all.R") here <- p
+  }
+  if (is.null(here)) getwd() else dirname(normalizePath(here, winslash = "/"))
+})
+setwd(ROOT)
+message("[run_all] working in ", ROOT)
+
 R_DIR  <- if (dir.exists("R"))        "R"        else "."
 AN_DIR <- if (dir.exists("analysis")) "analysis" else "."
-OUT    <- if (dir.exists("outputs"))  "outputs"  else "."
+OUT    <- file.path("outputs", "reports")   ## [repo 18.09.2026] rendered reports + run logs
 dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 LOG <- file.path(OUT, paste0("run_all_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
 
@@ -110,11 +134,12 @@ if (length(miss)) say("!! FILES NOT FOUND for: ", paste(miss, collapse = ", "))
 
 ## the data step is the one that fails for a reason worth naming
 if (isTRUE(STEPS[["data"]])) {
-  .root <- Sys.getenv("SGH_PROJ", unset = "C:/Users/rober/OneDrive/Masterkram/R")
-  .xl   <- file.path(.root, "scripts", "Finckh_Carmona_2023_PANGAEA_R1.xlsx")
+  .xl <- if (nzchar(Sys.getenv("SGH_PROJ")))
+    file.path(Sys.getenv("SGH_PROJ"), "scripts", "Finckh_Carmona_2023_PANGAEA_R1.xlsx") else
+    file.path("data-raw", "Finckh_Carmona_2023_PANGAEA_R1.xlsx")
   if (!file.exists(.xl))
     say("!! concentration file not found: ", .xl,
-        "   -- point the SGH_PROJ environment variable at your data tree")
+        "   -- put it in data-raw/ or point SGH_PROJ at your data tree")
 }
 
 ## ---- 5. run ----------------------------------------------------------------
